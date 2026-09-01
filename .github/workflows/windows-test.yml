@@ -80,6 +80,18 @@ jobs:
           node-version: ${{ fromJSON(inputs.params_json).node || '20' }}
           cache: pnpm
 
+      # windows-latest 镜像现已只带 VS 2026 (18.x),而 pnpm 9 自带的 node-gyp@10
+      # 不认识 VS 18(报 unknown version "undefined"),原生模块(better-sqlite3 等)
+      # 源码编译必挂。node-gyp v12.1.0+ 才支持 VS 2026 且兼容 node 20(v13 起
+      # 要求 node >=22,本 pipeline 用 node 20,故固定 ^12.1.0 而非 latest)。
+      # pnpm 9 尊重 npm_config_node_gyp 环境变量
+      # (env.npm_config_node_gyp || DEFAULT_NODE_GYP_PATH),用它让生命周期脚本走新版 node-gyp。
+      - name: Setup node-gyp with VS 2026 support
+        shell: bash
+        run: |
+          npm install -g node-gyp@^12.1.0
+          echo "npm_config_node_gyp=$(npm root -g)/node-gyp/bin/node-gyp.js" >> "$GITHUB_ENV"
+
       - name: pnpm install
         run: pnpm install --frozen-lockfile
 
