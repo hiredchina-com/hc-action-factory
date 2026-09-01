@@ -1,0 +1,169 @@
+name: pipeline/shell-lint
+
+# Bash/PowerShell 静态分析(替代 hunter-mate-harness lint.yml)
+#
+# params_json schema:
+# {
+#   "shellcheck_files": "install/bootstrap.sh bin/hmx ...",   # 空格分隔
+#   "shfmt_args": "-d -s -i 2 -ci bin install .harness/evaluators",
+#   "bash_syntax_files": "install/bootstrap.sh bin/hmx ...",
+#   "ps1_file": "install/bootstrap.ps1",
+#   "status_context": "factory/shell-lint",
+#   "notify": {"start": false, "finish": "failure"}
+# }
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: shell-lint-${{ inputs.repository }}-${{ inputs.ref_name || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: Bash (shellcheck + shfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        with:
+          additional_files: ${{ fromJSON(inputs.params_json).shellcheck_files }}
+
+      - name: shfmt check (CI mode)
+        uses: luizm/action-shfmt@v3
+        with:
+          shfmt_args: ${{ fromJSON(inputs.params_json).shfmt_args }}
+
+      - name: bash syntax parse
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          for f in $(jq -r '.bash_syntax_files // ""' <<< "$PARAMS"); do
+            bash -n "$f" || exit 1
+          done
+          echo "✓ bash syntax OK"
+
+  powershell:
+    name: PowerShell (PSScriptAnalyzer + parse)
+    runs-on: windows-latest
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module PSScriptAnalyzer
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          $ps1 = ($env:PARAMS | ConvertFrom-Json).ps1_file
+          $results = Invoke-ScriptAnalyzer -Path $ps1 -Severity Error,Warning
+          if ($results) {
+            $results | Format-Table -AutoSize
+            Write-Error "PSScriptAnalyzer found issues above"
+            exit 1
+          }
+          Write-Host "✓ PSScriptAnalyzer passed"
+
+      - name: Parse only (no execute)
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          $ps1 = ($env:PARAMS | ConvertFrom-Json).ps1_file
+          $null = [scriptblock]::Create((Get-Content -Raw $ps1))
+          Write-Host "✓ PowerShell parse OK"
+
+      - name: Smoke test -Help flag
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          $ps1 = ($env:PARAMS | ConvertFrom-Json).ps1_file
+          & $ps1 -Help
+          Write-Host "✓ -Help renders cleanly"
+
+  finalize:
+    name: finalize (status + notify)
+    needs: [shell, powershell]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve final state
+        id: state
+        env:
+          SHELL: ${{ needs.shell.result }}
+          PS: ${{ needs.powershell.result }}
+        run: |
+          if [[ "$SHELL" == "failure" || "$PS" == "failure" || "$SHELL" == "cancelled" || "$PS" == "cancelled" ]]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"; echo "emoji=[FAIL]" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=success" >> "$GITHUB_OUTPUT"; echo "emoji=[OK]" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ steps.state.outputs.state }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/shell-lint' }}
+          description: "shell=${{ needs.shell.result }} powershell=${{ needs.powershell.result }}"
+
+      - name: Notify finish
+        if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || steps.state.outputs.state == 'failure') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **${{ steps.state.outputs.emoji }} ${{ inputs.repository }} shell-lint**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+
+            - shell: ${{ needs.shell.result }} · powershell: ${{ needs.powershell.result }}
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

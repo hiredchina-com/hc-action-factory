@@ -1,0 +1,186 @@
+name: pipeline/e2e-device
+
+# Device flow 端到端测试(fauxauth 模拟 GitHub OAuth)—— 替代 hunter-mate-harness e2e-device.yml
+# 原 workflow 为手动触发;迁移后直接在工厂仓 workflow_dispatch,不再经过 dispatcher。
+#
+# params_json schema (dispatch 触发时):
+# { "os": "ubuntu|macos|windows", "bootstrap_sh": "bash install/bootstrap.sh", "bootstrap_ps1": "install/bootstrap.ps1" }
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "目标仓库 full name"
+        required: true
+        default: "hiredchina-com/hunter-mate-harness"
+      sha:
+        description: "目标 sha(默认目标仓 main HEAD,需显式给出)"
+        required: true
+      os:
+        description: "OS to test"
+        required: true
+        type: choice
+        default: "ubuntu"
+        options:
+          - ubuntu
+          - macos
+          - windows
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+env:
+  TARGET_REPO: ${{ inputs.repository }}
+  TARGET_SHA: ${{ inputs.sha }}
+
+jobs:
+  linux:
+    name: Linux device flow
+    # env context 不可用于 jobs.if,条件在此内联展开
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.os == 'ubuntu') || (github.event_name != 'workflow_dispatch' && fromJSON(inputs.params_json || '{}').os == 'ubuntu') }}
+    runs-on: ubuntu-latest
+    services:
+      fauxauth:
+        image: textbook/fauxauth:latest
+        ports:
+          - 4200:4200
+        env:
+          FAUXAUTH_CLIENT_ID: "178c6fc778ccc68e1d6a"
+          FAUXAUTH_CLIENT_SECRET: "test_secret"
+          FAUXAUTH_USER: "test-user"
+    env:
+      GH_HOST: "http://localhost:4200"
+      SKIP_OAUTH: "false"
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Verify fauxauth is reachable
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS http://localhost:4200/ >/dev/null 2>&1; then
+              echo "✓ fauxauth up"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run bootstrap (full device flow against mock)
+        env:
+          BOOTSTRAP_NON_INTERACTIVE: "true"
+        run: |
+          yes "" | bash install/bootstrap.sh 2>&1 | tee /tmp/bootstrap.log
+          echo "exit_code=${PIPESTATUS[0]}"
+
+      - name: Verify hosts.yml created
+        run: |
+          if [[ ! -f "$HOME/.config/gh/hosts.yml" ]]; then
+            echo "❌ hosts.yml not created"; exit 1
+          fi
+          echo "✓ hosts.yml created"
+
+  macos:
+    name: macOS device flow
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.os == 'macos') || (github.event_name != 'workflow_dispatch' && fromJSON(inputs.params_json || '{}').os == 'macos') }}
+    runs-on: macos-latest
+    services:
+      fauxauth:
+        image: textbook/fauxauth:latest
+        ports:
+          - 4200:4200
+        env:
+          FAUXAUTH_CLIENT_ID: "178c6fc778ccc68e1d6a"
+          FAUXAUTH_USER: "test-user"
+    env:
+      GH_HOST: "http://localhost:4200"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Run bootstrap (full device flow against mock)
+        run: |
+          yes "" | bash install/bootstrap.sh 2>&1 | tee /tmp/bootstrap.log
+
+      - name: Verify hosts.yml created
+        run: |
+          if [[ ! -f "$HOME/.config/gh/hosts.yml" ]]; then
+            echo "❌ hosts.yml not created"; exit 1
+          fi
+          echo "✓ hosts.yml created"
+
+  windows:
+    name: Windows device flow
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.os == 'windows') || (github.event_name != 'workflow_dispatch' && fromJSON(inputs.params_json || '{}').os == 'windows') }}
+    runs-on: windows-latest
+    services:
+      fauxauth:
+        image: textbook/fauxauth:latest
+        ports:
+          - 4200:4200
+        env:
+          FAUXAUTH_CLIENT_ID: "178c6fc778ccc68e1d6a"
+          FAUXAUTH_USER: "test-user"
+    env:
+      GH_HOST: "http://localhost:4200"
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+
+      - name: Run bootstrap (full device flow against mock)
+        shell: pwsh
+        run: |
+          $inputStream = [System.IO.MemoryStream]::new()
+          $writer = [System.IO.StreamWriter]::new($inputStream)
+          for ($i = 0; $i -lt 100; $i++) { $writer.WriteLine("") }
+          $writer.Flush()
+          $inputStream.Position = 0
+          & install/bootstrap.ps1 *>&1 | Tee-Object -FilePath C:\bootstrap.log
+
+      - name: Verify hosts.yml created
+        shell: pwsh
+        run: |
+          $hostsFile = Join-Path $env:USERPROFILE '.config\gh\hosts.yml'
+          if (-not (Test-Path $hostsFile)) {
+            Write-Error "hosts.yml not created"; exit 1
+          }
+          Write-Host "✓ hosts.yml created"

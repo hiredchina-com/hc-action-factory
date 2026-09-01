@@ -1,0 +1,269 @@
+name: pipeline/sync-deps
+
+# 依赖同步 + 自动开 PR(替代 hunter-mate sync-chromepilot-deps.yml)
+# 触发链:chromepilot pnpm-release(packages 发布成功)→ post_dispatch → router(event_type=sync-deps)→ 本 pipeline
+# 也可在工厂仓手动 workflow_dispatch(应急,替代原仓库的手动入口)。
+#
+# params_json schema:
+# {
+#   "package": "kit" | "logger-kit" | "all",
+#   "dep_scope": "@chromepilot",
+#   "base_branch": "main",
+#   "node": "22",
+#   "pnpm_version": "9.15.9",
+#   "test_cmd": "pnpm test --filter @hunter-mate/server",
+#   "overrides_cleanup": true,        # 移除 pnpm.overrides 中该 scope 的条目
+#   "tsconfig_paths_cleanup": true,   # 移除 packages/*/tsconfig.json 中 logger-kit/nestjs paths
+#   "import_restore": true,           # dist/nestjs → nestjs import 还原
+#   "status_context": "factory/sync-deps"
+# }
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "目标仓库 full name"
+        required: true
+        default: "hiredchina-com/hunter-mate"
+      target_package:
+        description: "目标包(kit / logger-kit / all)"
+        required: true
+        type: choice
+        default: "all"
+        options:
+          - kit
+          - logger-kit
+          - all
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        default: ""     # 空 = base_branch HEAD
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Detect + sync + PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve params
+        id: cfg
+        env:
+          PARAMS: ${{ inputs.params_json }}
+          DISPATCH_PKG: ${{ github.event_name == 'workflow_dispatch' && inputs.target_package || '' }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch 触发时 params_json 未声明,env 为空字符串
+          [[ -z "$PARAMS" ]] && PARAMS="{}"
+          if [[ "$PARAMS" == "{}" && -n "$DISPATCH_PKG" ]]; then
+            PARAMS=$(jq -nc --arg p "$DISPATCH_PKG" '{package:$p}')
+          fi
+          PKG=$(jq -r '.package // "all"' <<< "$PARAMS")
+          echo "params=$PARAMS" >> "$GITHUB_OUTPUT"
+          echo "package=$PKG" >> "$GITHUB_OUTPUT"
+          echo "dep_scope=$(jq -r '.dep_scope // "@chromepilot"' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$(jq -r '.base_branch // "main"' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+          echo "node=$(jq -r '.node // "22"' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+          echo "pnpm_version=$(jq -r '.pnpm_version // ""' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha != '' && inputs.sha || steps.cfg.outputs.base_branch }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: 0
+
+      - name: Resolve HEAD sha
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm (pinned)
+        if: ${{ steps.cfg.outputs.pnpm_version != '' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ steps.cfg.outputs.pnpm_version }}
+
+      - name: Setup pnpm (packageManager field)
+        if: ${{ steps.cfg.outputs.pnpm_version == '' }}
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.cfg.outputs.node }}
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: 读取当前依赖版本
+        id: current
+        env:
+          PKG: ${{ steps.cfg.outputs.package }}
+          SCOPE: ${{ steps.cfg.outputs.dep_scope }}
+        run: |
+          P="$PKG"; [[ "$P" == "all" ]] && P="kit"
+          echo "current=$(node -p "require('./package.json').dependencies['${SCOPE}/${P}']")" >> "$GITHUB_OUTPUT"
+
+      - name: 解析目标版本(npm latest)
+        id: target
+        env:
+          PKG: ${{ steps.cfg.outputs.package }}
+          SCOPE: ${{ steps.cfg.outputs.dep_scope }}
+        run: |
+          P="$PKG"; [[ "$P" == "all" ]] && P="kit"
+          echo "package=$P" >> "$GITHUB_OUTPUT"
+          echo "target=$(npm view "${SCOPE}/${P}" version)" >> "$GITHUB_OUTPUT"
+
+      - name: 检测是否需要同步
+        id: need
+        env:
+          CUR: ${{ steps.current.outputs.current }}
+          TGT: ${{ steps.target.outputs.target }}
+        run: |
+          CUR_VER=$(printf '%s' "$CUR" | sed -E 's/^[\^~>=]+\s*//')
+          if [[ "$CUR_VER" == "$TGT" ]]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "已是最新 $CUR_VER"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "当前 $CUR_VER → 目标 $TGT,需要更新"
+          fi
+
+      - name: Bump 依赖版本
+        if: ${{ steps.need.outputs.match != 'true' }}
+        env:
+          SCOPE: ${{ steps.cfg.outputs.dep_scope }}
+          PKG: ${{ steps.target.outputs.package }}
+          TGT: ${{ steps.target.outputs.target }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json'));
+            pkg.dependencies[process.env.SCOPE + '/' + process.env.PKG] = process.env.TGT;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+            console.log('updated to', process.env.TGT);
+          "
+
+      - name: 移除 pnpm.overrides 兜底
+        if: ${{ steps.need.outputs.match != 'true' && fromJSON(steps.cfg.outputs.params).overrides_cleanup != false }}
+        env:
+          SCOPE: ${{ steps.cfg.outputs.dep_scope }}
+        run: |
+          python3 -c "
+            import json, os
+            scope = os.environ['SCOPE']
+            with open('package.json') as f:
+                pkg = json.load(f)
+            ov = pkg.get('pnpm', {}).get('overrides', {})
+            for k in [k for k in ov if k.startswith(scope + '/')]:
+                ov.pop(k, None)
+            if not ov:
+                pkg.get('pnpm', {}).pop('overrides', None)
+            with open('package.json', 'w') as f:
+                json.dump(pkg, f, indent=2)
+                f.write('\n')
+            print('overrides cleaned')
+          "
+
+      - name: 移除 tsconfig paths mapping
+        if: ${{ steps.need.outputs.match != 'true' && fromJSON(steps.cfg.outputs.params).tsconfig_paths_cleanup != false }}
+        run: |
+          for f in packages/*/tsconfig.json; do
+            [ -f "$f" ] || continue
+            python3 -c "
+              import json
+              with open('$f') as fp: cfg = json.load(fp)
+              c = cfg.get('compilerOptions', {})
+              p = c.get('paths', {})
+              p.pop('@chromepilot/logger-kit/nestjs', None)
+              if p:
+                c['paths'] = p
+              else:
+                c.pop('paths', None)
+              with open('$f', 'w') as fp: json.dump(cfg, fp, indent=2); fp.write('\n')
+            "
+          done
+
+      - name: 还原 import 路径
+        if: ${{ steps.need.outputs.match != 'true' && fromJSON(steps.cfg.outputs.params).import_restore != false }}
+        run: |
+          find packages -name "*.ts" -type f | while read -r f; do
+            sed -i.bak "s|@chromepilot/logger-kit/dist/nestjs|@chromepilot/logger-kit/nestjs|g" "$f"
+            rm -f "$f.bak"
+          done
+
+      - name: Install + typecheck + test
+        if: ${{ steps.need.outputs.match != 'true' }}
+        env:
+          PARAMS: ${{ steps.cfg.outputs.params }}
+        run: |
+          set -euo pipefail
+          pnpm install
+          pnpm typecheck
+          TEST_CMD=$(jq -r '.test_cmd // ""' <<< "$PARAMS")
+          [[ -n "$TEST_CMD" ]] && eval "$TEST_CMD"
+
+      - name: Commit + push branch + PR
+        if: ${{ steps.need.outputs.match != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
+          REPO: ${{ inputs.repository }}
+          BASE: ${{ steps.cfg.outputs.base_branch }}
+          SCOPE: ${{ steps.cfg.outputs.dep_scope }}
+          PKG: ${{ steps.target.outputs.package }}
+          TGT: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          git config user.email "harness-bot@belloai.com"
+          git config user.name "harness-bot"
+          BRANCH="chore/${PKG}-sync-${TGT}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "chore(deps): sync ${SCOPE}/${PKG} to ${TGT}
+
+          Auto-synced by hc-action-factory pipeline/sync-deps"
+          git push origin "$BRANCH"
+          gh pr create --repo "$REPO" \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "chore(deps): sync ${SCOPE}/${PKG} to ${TGT}" \
+            --body "Auto-synced by hc-action-factory pipeline/sync-deps." \
+            --label dependencies \
+          || gh pr create --repo "$REPO" \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "chore(deps): sync ${SCOPE}/${PKG} to ${TGT}" \
+            --body "Auto-synced by hc-action-factory pipeline/sync-deps."
+
+      - name: Report status
+        if: always()
+        uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ steps.head.outputs.sha }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          context: ${{ fromJSON(steps.cfg.outputs.params).status_context || 'factory/sync-deps' }}
+          description: "sync-deps: ${{ job.status }}"

@@ -1,0 +1,233 @@
+name: pipeline/docker-acr-deploy
+
+# Docker 构建 → 阿里云 ACR → SSH(cloudflared)受控部署
+# 合并替代 dev-ops 与 job-pages 的 deploy.yml(两仓 95% 同构,差异全部走 params)
+#
+# params_json schema:
+# {
+#   "dockerfile": "infra/Dockerfile",         # 缺省 "Dockerfile"(context 为仓库根)
+#   "registry": "registry.cn-shenzhen.aliyuncs.com",
+#   "image": "registry.cn-shenzhen.aliyuncs.com/hiredchina/job-pages",
+#   "local_tag": "job-pages",                  # 服务器侧 retag 名
+#   "server_host": "jp-ssh.hiredchina.com",
+#   "server_user": "deployer",
+#   "remote_script": "docker pull ... && /opt/job-pages/bin/jobpagesctl deploy \"$SHA\"",  # 服务器侧 bash,$SHA/$REMOTE_IMAGE 可用
+#   "rollback_hint": "/opt/job-pages/bin/jobpagesctl rollback",
+#   "build_timeout": 60,
+#   "deploy_timeout": 45,
+#   "status_context": "factory/deploy",
+#   "notify": {"start": true, "finish": "always"}
+# }
+#
+# 服务器运维边界不变:runner 只做 docker pull/retag + params.remote_script 内的既定命令,
+# 不读取/输出服务器 .env,不删 volume/镜像/数据(对齐 hard-rules 规则 18 精神)。
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: deploy-${{ inputs.repository }}
+  cancel-in-progress: true
+
+jobs:
+  begin:
+    name: begin (status pending + notify start)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: pending
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/deploy' }}
+          description: "deploy started"
+      - name: Notify start
+        if: ${{ fromJSON(inputs.params_json).notify.start != false }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **[START] ${{ inputs.repository }} deploy**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - 分支: `${{ inputs.ref_name }}`
+            - deploy_sha: `${{ inputs.sha }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  build-push-deploy:
+    name: Build → Push ACR → deploy
+    needs: begin
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.params_json).build_timeout || 60 }}
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Resolve deploy SHA
+        id: sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "非法 SHA: $sha" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "部署版本: $sha"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ fromJSON(inputs.params_json).registry }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ fromJSON(inputs.params_json).dockerfile || 'Dockerfile' }}
+          push: true
+          tags: ${{ fromJSON(inputs.params_json).image }}:${{ steps.sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 阿里云 ACR 不支持 OCI attestation
+          provenance: false
+
+      - name: Setup cloudflared & SSH
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          SERVER_HOST=$(jq -r '.server_host' <<< "$PARAMS")
+          SERVER_USER=$(jq -r '.server_user // "deployer"' <<< "$PARAMS")
+          sudo curl -sL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          sudo chmod +x /usr/local/bin/cloudflared
+
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.JP_DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # host key pin:与 hw jp doctor 同源指纹校验,防中间人
+          printf '%s\n' "${{ secrets.JP_SERVER_HOST_KEY }}" > ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
+          Host $SERVER_HOST
+            User $SERVER_USER
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Deploy to server
+        timeout-minutes: ${{ fromJSON(inputs.params_json).deploy_timeout || 45 }}
+        env:
+          PARAMS: ${{ inputs.params_json }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          REMOTE_IMAGE: ${{ fromJSON(inputs.params_json).image }}:${{ steps.sha.outputs.sha }}
+          ACR_REGISTRY: ${{ fromJSON(inputs.params_json).registry }}
+          ACR_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SERVER_HOST=$(jq -r '.server_host' <<< "$PARAMS")
+          LOCAL_TAG=$(jq -r '.local_tag' <<< "$PARAMS")
+          REMOTE_SCRIPT=$(jq -r '.remote_script' <<< "$PARAMS")
+
+          # 服务器侧登录 ACR;凭证经 stdin 管道,不落远程命令行/进程列表
+          printf '%s' "$ACR_PASSWORD" | ssh "$SERVER_HOST" \
+            "docker login '$ACR_REGISTRY' -u '$ACR_USER' --password-stdin"
+
+          ssh "$SERVER_HOST" bash -s <<REMOTE
+          set -euo pipefail
+          echo "== pull $REMOTE_IMAGE =="
+          docker pull "$REMOTE_IMAGE"
+          docker tag "$REMOTE_IMAGE" "$LOCAL_TAG:$SHA"
+
+          echo "== deploy =="
+          $REMOTE_SCRIPT
+          REMOTE
+
+      - name: Rollback hint (on failure)
+        if: failure()
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          HINT=$(jq -r '.rollback_hint // "见服务器部署工具文档"' <<< "$PARAMS")
+          echo "::error::部署失败。回滚入口: $HINT;排查: hw jp status / hw jp logs"
+
+  finalize:
+    name: finalize (status + notify finish)
+    needs: [begin, build-push-deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve final state
+        id: state
+        env:
+          RESULT: ${{ needs.build-push-deploy.result }}
+        run: |
+          case "$RESULT" in
+            success)   echo "state=success" >> "$GITHUB_OUTPUT"; echo "emoji=[OK]" >> "$GITHUB_OUTPUT" ;;
+            failure)   echo "state=failure" >> "$GITHUB_OUTPUT"; echo "emoji=[FAIL]" >> "$GITHUB_OUTPUT" ;;
+            cancelled) echo "state=error" >> "$GITHUB_OUTPUT";   echo "emoji=[CANCEL]" >> "$GITHUB_OUTPUT" ;;
+            *)         echo "state=error" >> "$GITHUB_OUTPUT";   echo "emoji=[LOG]" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ steps.state.outputs.state }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/deploy' }}
+          description: "deploy: ${{ needs.build-push-deploy.result }}"
+
+      - name: Notify finish
+        if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || needs.build-push-deploy.result == 'failure') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **${{ steps.state.outputs.emoji }} ${{ inputs.repository }} deploy ${{ needs.build-push-deploy.result }}**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - deploy_sha: `${{ inputs.sha }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

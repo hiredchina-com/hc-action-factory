@@ -1,0 +1,104 @@
+name: pipeline/os-eval
+
+# 3-OS matrix 跑 evaluator 脚本(替代 hunter-mate-harness init-flow-test.yml)
+#
+# params_json schema:
+# {
+#   "os": ["ubuntu-latest","macos-latest","windows-latest"],
+#   "node": "22",
+#   "evaluators": ["bash .harness/evaluators/init-flow.sh", "..."],   # 逐条执行(bash)
+#   "status_context": "factory/os-eval",
+#   "notify": {"start": false, "finish": "failure"}
+# }
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: os-eval-${{ inputs.repository }}-${{ inputs.ref_name || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    name: Evaluator (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.params_json).os }}
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ fromJSON(inputs.params_json).node || '22' }}
+
+      - name: Run evaluators
+        shell: bash
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.evaluators[]?' <<< "$PARAMS" | while IFS= read -r cmd; do
+            echo "== $cmd =="
+            bash -euo pipefail -c "$cmd"
+          done
+
+  finalize:
+    name: finalize (status + notify)
+    needs: evaluate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ needs.evaluate.result == 'success' && 'success' || 'failure' }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/os-eval' }}
+          description: "os-eval: ${{ needs.evaluate.result }}"
+
+      - name: Notify finish
+        if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || needs.evaluate.result != 'success') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **[${{ needs.evaluate.result == 'success' && 'OK' || 'FAIL' }}] ${{ inputs.repository }} os-eval ${{ needs.evaluate.result }}**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

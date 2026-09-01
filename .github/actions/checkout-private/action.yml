@@ -1,0 +1,40 @@
+name: checkout-private
+description: >-
+  Checkout a private repository at a given sha/branch using a cross-repo PAT.
+  The factory repo is public and runs builds for private repos on free runners;
+  all private code enters the runner through this single action so the token
+  handling stays in one place.
+inputs:
+  repository:
+    description: "Full name of the target (private) repo, e.g. hiredchina-com/hunter-mate"
+    required: true
+  ref:
+    description: "sha (preferred), branch or tag to checkout"
+    required: true
+  token:
+    description: "PAT with contents:read on the target repo (FACTORY_PAT)"
+    required: true
+  fetch-depth:
+    description: "fetch-depth for checkout (0 = full history, needed by release/tag logic)"
+    default: "0"
+runs:
+  using: composite
+  steps:
+    - name: Guard ref format
+      # 用 sh 而非 bash:本 action 会在 alpine 等无 bash 的 container job 里首先执行
+      shell: sh
+      env:
+        REF: ${{ inputs.ref }}
+      run: |
+        # 拒绝空格/控制字符,防止 ref 注入 checkout 参数
+        if printf '%s' "$REF" | grep -qE '[[:space:]]'; then
+          echo "✗ illegal ref: contains whitespace" >&2
+          exit 1
+        fi
+    - name: Checkout ${{ inputs.repository }} @ ${{ inputs.ref }}
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        fetch-depth: ${{ inputs.fetch-depth }}

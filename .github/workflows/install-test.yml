@@ -1,0 +1,234 @@
+name: pipeline/install-test
+
+# 安装引导跨平台测试(替代 hunter-mate-harness install-test.yml)
+# macOS 私有仓 10x 计费 → 工厂免费,这是全工厂收益最大的 pipeline。
+#
+# params_json schema:
+# {
+#   "containers": ["ubuntu:24.04","debian:bookworm-slim","alpine:3.20"],
+#   "bootstrap_sh": "bash install/bootstrap.sh --skip-oauth",
+#   "bootstrap_ps1": "./install/bootstrap.ps1 -SkipOAuth",
+#   "smoke_sh": "<bash 冒烟命令,可选>",
+#   "verify_tools": ["git","node","gh"],    # 安装后 --version 校验
+#   "enable_macos": true,
+#   "enable_windows": true,
+#   "status_context": "factory/install-test",
+#   "notify": {"start": false, "finish": "failure"}
+# }
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: install-test-${{ inputs.repository }}-${{ inputs.ref_name || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.container }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container: ${{ fromJSON(inputs.params_json).containers }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Install sudo + git + curl in container
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y --no-install-recommends sudo git curl ca-certificates bash
+          elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache sudo git curl ca-certificates bash
+          fi
+
+      - name: Run bootstrap
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.bootstrap_sh' <<< "$PARAMS" | bash -euo pipefail
+
+      - name: Verify installed tools
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          for t in $(jq -r '.verify_tools[]?' <<< "$PARAMS"); do
+            echo "=== $t ===" && "$t" --version
+          done
+          echo "✓ all tools installed"
+
+      - name: Smoke test
+        if: ${{ fromJSON(inputs.params_json).smoke_sh != null }}
+        shell: bash
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.smoke_sh' <<< "$PARAMS" | bash -euo pipefail
+
+  macos:
+    name: macOS (latest)
+    if: ${{ fromJSON(inputs.params_json).enable_macos != false }}
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Run bootstrap
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.bootstrap_sh' <<< "$PARAMS" | bash -euo pipefail
+
+      - name: Verify installed tools
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          for t in $(jq -r '.verify_tools[]?' <<< "$PARAMS"); do
+            echo "=== $t ===" && "$t" --version
+          done
+          echo "✓ all tools installed"
+
+      - name: Smoke test
+        if: ${{ fromJSON(inputs.params_json).smoke_sh != null }}
+        shell: bash
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.smoke_sh' <<< "$PARAMS" | bash -euo pipefail
+
+  windows:
+    name: Windows (latest)
+    if: ${{ fromJSON(inputs.params_json).enable_windows != false }}
+    runs-on: windows-latest
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+
+      - name: Run bootstrap
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          $script = ($env:PARAMS | ConvertFrom-Json).bootstrap_ps1
+          Invoke-Expression $script
+
+      - name: Verify installed tools
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          ($env:PARAMS | ConvertFrom-Json).verify_tools | ForEach-Object {
+            Write-Host "=== $_ ==="
+            & $_ --version
+          }
+          Write-Host "✓ all tools installed"
+
+      - name: Smoke test
+        if: ${{ fromJSON(inputs.params_json).smoke_sh != null }}
+        shell: bash
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.smoke_sh' <<< "$PARAMS" | bash -euo pipefail
+
+  finalize:
+    name: finalize (status + notify)
+    needs: [linux, macos, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve final state
+        id: state
+        env:
+          LINUX: ${{ needs.linux.result }}
+          MACOS: ${{ needs.macos.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          FAILED=0
+          for r in "$LINUX" "$MACOS" "$WINDOWS"; do
+            case "$r" in failure|cancelled) FAILED=1;; esac
+          done
+          if [[ "$FAILED" == "1" ]]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"; echo "emoji=[FAIL]" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=success" >> "$GITHUB_OUTPUT"; echo "emoji=[OK]" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ steps.state.outputs.state }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/install-test' }}
+          description: "linux=${{ needs.linux.result }} macos=${{ needs.macos.result }} windows=${{ needs.windows.result }}"
+
+      - name: Notify finish
+        if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || steps.state.outputs.state == 'failure') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **${{ steps.state.outputs.emoji }} ${{ inputs.repository }} install-test**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - linux: ${{ needs.linux.result }} · macos: ${{ needs.macos.result }} · windows: ${{ needs.windows.result }}
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

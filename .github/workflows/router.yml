@@ -1,0 +1,192 @@
+name: router
+
+# 事件入口:私有仓 dispatcher 通过 repository_dispatch 把任务发到这里,
+# guard 校验后按 event_type 路由到对应 reusable pipeline。
+#
+# client_payload 公共字段:
+#   repository   目标私有仓 full name(必须 hiredchina-com/*)
+#   sha          40 位 commit sha(sync-deps 允许空 = base 分支 HEAD)
+#   ref_name / actor / event_name / commit_msg / commit_author / pr_number / pr_title
+#   force        "true" 时 pnpm-release 忽略 version 未变化的 skip
+#   params       pipeline 特定参数(object,见各 pipeline 头注释)
+on:
+  repository_dispatch:
+    types:
+      - pnpm-ci
+      - pnpm-release
+      - windows-test
+      - docker-acr-deploy
+      - install-test
+      - os-eval
+      - shell-lint
+      - sync-deps
+
+jobs:
+  guard:
+    name: validate payload
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.v.outputs.repository }}
+      sha: ${{ steps.v.outputs.sha }}
+      ref_name: ${{ steps.v.outputs.ref_name }}
+      actor: ${{ steps.v.outputs.actor }}
+      event_name: ${{ steps.v.outputs.event_name }}
+      commit_msg: ${{ steps.v.outputs.commit_msg }}
+      commit_author: ${{ steps.v.outputs.commit_author }}
+      pr_number: ${{ steps.v.outputs.pr_number }}
+      pr_title: ${{ steps.v.outputs.pr_title }}
+      force: ${{ steps.v.outputs.force }}
+      params_json: ${{ steps.v.outputs.params_json }}
+    steps:
+      - name: Validate & normalize
+        id: v
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          EVENT_TYPE: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          echo "$PAYLOAD" | jq . || { echo "✗ client_payload 不是合法 JSON"; exit 1; }
+
+          REPO=$(jq -r '.repository // ""' <<< "$PAYLOAD")
+          [[ "$REPO" =~ ^hiredchina-com/[a-zA-Z0-9._-]+$ ]] || { echo "✗ repository 非法或不在 hiredchina-com: '$REPO'"; exit 1; }
+
+          SHA=$(jq -r '.sha // ""' <<< "$PAYLOAD")
+          if [[ "$EVENT_TYPE" != "sync-deps" || -n "$SHA" ]]; then
+            [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ sha 非法: '$SHA'"; exit 1; }
+          fi
+
+          # params 缺省归一化为 {};必须是 object
+          PT=$(jq -r '.params // {} | type' <<< "$PAYLOAD")
+          [[ "$PT" == "object" ]] || { echo "✗ params 必须是 object"; exit 1; }
+          PARAMS=$(jq -c '.params // {}' <<< "$PAYLOAD")
+
+          out() { echo "$1=$(jq -r ".$1 // \"\"" <<< "$PAYLOAD" | tr '\n' ' ' | cut -c1-300)" >> "$GITHUB_OUTPUT"; }
+          out repository; out ref_name; out actor; out commit_msg; out commit_author; out pr_number; out pr_title
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "event_name=$(jq -r '.event_name // "repository_dispatch"' <<< "$PAYLOAD")" >> "$GITHUB_OUTPUT"
+          echo "force=$(jq -r '.force // "false"' <<< "$PAYLOAD")" >> "$GITHUB_OUTPUT"
+          echo "params_json=$PARAMS" >> "$GITHUB_OUTPUT"
+          echo "✓ payload valid: $EVENT_TYPE -> $REPO@$SHA"
+
+  pnpm-ci:
+    needs: guard
+    if: github.event.action == 'pnpm-ci'
+    uses: ./.github/workflows/pnpm-ci.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      pr_number: ${{ needs.guard.outputs.pr_number }}
+      pr_title: ${{ needs.guard.outputs.pr_title }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  pnpm-release:
+    needs: guard
+    if: github.event.action == 'pnpm-release'
+    uses: ./.github/workflows/pnpm-release.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      force: ${{ needs.guard.outputs.force }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  windows-test:
+    needs: guard
+    if: github.event.action == 'windows-test'
+    uses: ./.github/workflows/windows-test.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  docker-acr-deploy:
+    needs: guard
+    if: github.event.action == 'docker-acr-deploy'
+    uses: ./.github/workflows/docker-acr-deploy.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  install-test:
+    needs: guard
+    if: github.event.action == 'install-test'
+    uses: ./.github/workflows/install-test.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  os-eval:
+    needs: guard
+    if: github.event.action == 'os-eval'
+    uses: ./.github/workflows/os-eval.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  shell-lint:
+    needs: guard
+    if: github.event.action == 'shell-lint'
+    uses: ./.github/workflows/shell-lint.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  sync-deps:
+    needs: guard
+    if: github.event.action == 'sync-deps'
+    uses: ./.github/workflows/sync-deps.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      ref_name: ${{ needs.guard.outputs.ref_name }}
+      actor: ${{ needs.guard.outputs.actor }}
+      event_name: ${{ needs.guard.outputs.event_name }}
+      commit_msg: ${{ needs.guard.outputs.commit_msg }}
+      commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}

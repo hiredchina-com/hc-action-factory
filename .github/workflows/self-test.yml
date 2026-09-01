@@ -1,0 +1,54 @@
+name: self-test
+
+# 工厂自检:验证 report-status + checkout-private + secrets 链路完好。
+# 触发:手动 workflow_dispatch;或 repository_dispatch type=self-test(可做外部拨测)。
+on:
+  workflow_dispatch:
+    inputs:
+      probe_repository:
+        description: "可选:用于验证 PAT 读权限的私有仓 full name(留空跳过)"
+        required: false
+        default: ""
+      probe_sha:
+        description: "可选:probe 仓库的 40 位 sha"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [self-test]
+
+jobs:
+  self-test:
+    name: factory self-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show trigger context
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "event: ${{ github.event_name }} / action: ${{ github.event.action }}"
+          echo "payload: ${PAYLOAD:-<none>}"
+
+      - name: report-status on factory repo itself
+        uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: hiredchina-com/hc-action-factory
+          sha: ${{ github.sha }}
+          state: success
+          context: factory/self-test
+          description: "self-test OK (event=${{ github.event_name }})"
+
+      - name: Probe private repo read (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.probe_repository != '' }}
+        uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.probe_repository }}
+          ref: ${{ inputs.probe_sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Verify probe checkout
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.probe_repository != '' }}
+        run: |
+          git log -1 --oneline
+          echo "✓ FACTORY_PAT 可读 ${{ inputs.probe_repository }}"

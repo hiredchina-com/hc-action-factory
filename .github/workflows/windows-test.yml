@@ -1,0 +1,128 @@
+name: pipeline/windows-test
+
+# Windows 构建+测试(替代 hunter-mate test-windows.yml;windows 私有仓 2x 计费 → 工厂免费)
+#
+# params_json schema:
+# {
+#   "node": "20",
+#   "pnpm_version": "9",
+#   "scripts": ["-r build","-r test"],      # 依次执行 pnpm <script>;用 "run xxx" 形式亦可
+#   "verify_pwsh": "<pwsh 脚本,可选>",      # 如 Windows shim 存在性校验
+#   "status_context": "factory/windows-test",
+#   "timeout": 30,
+#   "notify": {"start": false, "finish": "failure"}
+# }
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: windows-test-${{ inputs.repository }}-${{ inputs.ref_name || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: pnpm build + test on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(inputs.params_json).timeout || 30 }}
+    steps:
+      - name: Report pending
+        uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: pending
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/windows-test' }}
+          description: "windows test started"
+
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ fromJSON(inputs.params_json).pnpm_version || '9' }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ fromJSON(inputs.params_json).node || '20' }}
+          cache: pnpm
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Run scripts
+        shell: bash
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          for s in $(jq -r '.scripts[]?' <<< "$PARAMS"); do
+            echo "== pnpm $s =="
+            pnpm $s
+          done
+
+      - name: Verify (pwsh)
+        if: ${{ fromJSON(inputs.params_json).verify_pwsh != null }}
+        shell: pwsh
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          $script = ($env:PARAMS | ConvertFrom-Json).verify_pwsh
+          Invoke-Expression $script
+
+      - name: Report result
+        if: always()
+        uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ job.status == 'success' && 'success' || 'failure' }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/windows-test' }}
+          description: "windows test: ${{ job.status }}"
+
+      - name: Notify finish
+        if: ${{ always() && fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || job.status != 'success') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **[${{ job.status == 'success' && 'OK' || 'FAIL' }}] ${{ inputs.repository }} windows-test ${{ job.status }}**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

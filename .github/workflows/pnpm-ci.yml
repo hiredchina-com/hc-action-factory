@@ -1,0 +1,190 @@
+name: pipeline/pnpm-ci
+
+# pnpm 项目通用 CI(替代各私有仓 ci.yml 的重计算部分)
+# 由 router.yml 按 event_type=pnpm-ci 调用;也支持 workflow_call 复用。
+#
+# params_json schema:
+# {
+#   "node": ["20","22"],                     # matrix;缺省 ["22"]
+#   "pnpm_version": "9",                     # '' = 读 package.json packageManager
+#   "install": "pnpm install --frozen-lockfile",
+#   "scripts": ["typecheck","build","test"], # 依次 pnpm run
+#   "verify": "<bash 脚本,可选>",            # 构建后额外校验(如资产存在性检查)
+#   "artifact": {"name":"cli-dist","path":"packages/cli/dist","on_node":"22"},  # 可选
+#   "status_context": "factory/pnpm-ci",
+#   "notify": {"start": true, "finish": "always"}   # finish: always|failure|never
+# }
+on:
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      ref_name:
+        type: string
+        default: ""
+      actor:
+        type: string
+        default: ""
+      event_name:
+        type: string
+        default: ""
+      commit_msg:
+        type: string
+        default: ""
+      commit_author:
+        type: string
+        default: ""
+      pr_number:
+        type: string
+        default: ""
+      pr_title:
+        type: string
+        default: ""
+      params_json:
+        type: string
+        default: "{}"
+
+concurrency:
+  group: pnpm-ci-${{ inputs.repository }}-${{ inputs.ref_name || inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  begin:
+    name: begin (status pending + notify start)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: pending
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/pnpm-ci' }}
+          description: "factory run started"
+      - name: Notify start
+        if: ${{ fromJSON(inputs.params_json).notify.start != false }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **[START] ${{ inputs.repository }} pnpm-ci**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  ci:
+    name: Build & Test (node ${{ matrix.node }})
+    needs: begin
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ${{ fromJSON(inputs.params_json).node || fromJSON('["22"]') }}
+    steps:
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Setup pnpm (pinned)
+        if: ${{ fromJSON(inputs.params_json).pnpm_version != '' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ fromJSON(inputs.params_json).pnpm_version }}
+
+      - name: Setup pnpm (packageManager field)
+        if: ${{ fromJSON(inputs.params_json).pnpm_version == '' }}
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install deps
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          INSTALL=$(jq -r '.install // "pnpm install --frozen-lockfile"' <<< "$PARAMS")
+          echo "== $INSTALL =="
+          eval "$INSTALL"
+
+      - name: Run scripts
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          for s in $(jq -r '.scripts[]?' <<< "$PARAMS"); do
+            echo "== pnpm run $s =="
+            pnpm run "$s"
+          done
+
+      - name: Verify
+        if: ${{ fromJSON(inputs.params_json).verify != null }}
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          jq -r '.verify' <<< "$PARAMS" | bash -euo pipefail
+
+      - name: Upload artifact
+        if: ${{ fromJSON(inputs.params_json).artifact != null && matrix.node == fromJSON(inputs.params_json).artifact.on_node }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJSON(inputs.params_json).artifact.name }}
+          path: ${{ fromJSON(inputs.params_json).artifact.path }}
+          retention-days: 7
+
+  finalize:
+    name: finalize (status + notify finish)
+    needs: [begin, ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve final state
+        id: state
+        env:
+          RESULT: ${{ needs.ci.result }}
+        run: |
+          case "$RESULT" in
+            success)   echo "state=success" >> "$GITHUB_OUTPUT"; echo "emoji=[OK]" >> "$GITHUB_OUTPUT" ;;
+            failure)   echo "state=failure" >> "$GITHUB_OUTPUT"; echo "emoji=[FAIL]" >> "$GITHUB_OUTPUT" ;;
+            cancelled) echo "state=error" >> "$GITHUB_OUTPUT";   echo "emoji=[CANCEL]" >> "$GITHUB_OUTPUT" ;;
+            *)         echo "state=error" >> "$GITHUB_OUTPUT";   echo "emoji=[LOG]" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: ./.github/actions/report-status
+        with:
+          token: ${{ secrets.FACTORY_PAT }}
+          repository: ${{ inputs.repository }}
+          sha: ${{ inputs.sha }}
+          state: ${{ steps.state.outputs.state }}
+          context: ${{ fromJSON(inputs.params_json).status_context || 'factory/pnpm-ci' }}
+          description: "ci: ${{ needs.ci.result }}"
+
+      - name: Notify finish
+        if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || needs.ci.result == 'failure' || needs.ci.result == 'cancelled') }}
+        uses: ./.github/actions/wecom-notify
+        with:
+          webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
+          content: |
+            **${{ steps.state.outputs.emoji }} ${{ inputs.repository }} pnpm-ci ${{ needs.ci.result }}**
+
+            > **Event**: `${{ inputs.event_name }}` · **Actor**: @${{ inputs.actor }}
+            > **Commit**: `${{ inputs.sha }}` — ${{ inputs.commit_msg }}
+            > **Author**: @${{ inputs.commit_author }}
+
+            - 分支: `${{ inputs.ref_name }}`
+            - 链接: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

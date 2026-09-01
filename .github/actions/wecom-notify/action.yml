@@ -1,0 +1,24 @@
+name: wecom-notify
+description: >-
+  Send a markdown message to a WeCom (企业微信) group bot. Mirrors the notify
+  jobs that used to live in each private repo; failures never break the build.
+inputs:
+  webhook_url:
+    description: "WECOM_WEBHOOK_URL secret value"
+    required: true
+  content:
+    description: "Markdown message body"
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Send WeCom markdown
+      shell: bash
+      env:
+        WEBHOOK: ${{ inputs.webhook_url }}
+        CONTENT: ${{ inputs.content }}
+      run: |
+        [[ -z "$WEBHOOK" ]] && { echo "no webhook configured, skip"; exit 0; }
+        PAYLOAD=$(jq -nc --arg c "$CONTENT" '{msgtype:"markdown",markdown:{content:$c}}')
+        curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+          -d "$PAYLOAD" "$WEBHOOK" > /dev/null || echo "notify failed (non-fatal)" >&2
