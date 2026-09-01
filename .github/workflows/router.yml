@@ -60,7 +60,9 @@ jobs:
           [[ "$PT" == "object" ]] || { echo "✗ params 必须是 object"; exit 1; }
           PARAMS=$(jq -c '.params // {}' <<< "$PAYLOAD")
 
-          out() { echo "$1=$(jq -r ".$1 // \"\"" <<< "$PAYLOAD" | tr '\n' ' ' | cut -c1-300)" >> "$GITHUB_OUTPUT"; }
+          # tr 把多行 commit_msg 拍平为单行,但会给单值字段留尾部空格
+          # (repository 带空格会拼进 status API URL 导致 curl malformed),必须 rtrim
+          out() { echo "$1=$(jq -r ".$1 // \"\"" <<< "$PAYLOAD" | tr '\n' ' ' | cut -c1-300 | sed -e 's/[[:space:]]*$//')" >> "$GITHUB_OUTPUT"; }
           out repository; out ref_name; out actor; out commit_msg; out commit_author; out pr_number; out pr_title
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "event_name=$(jq -r '.event_name // "repository_dispatch"' <<< "$PAYLOAD")" >> "$GITHUB_OUTPUT"
