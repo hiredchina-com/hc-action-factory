@@ -274,6 +274,15 @@ jobs:
             echo
             git log --pretty=format:"- %s (%h)" "$RANGE" | head -50
             echo
+            INSTALL_CMD=$(jq -r '.install_cmd // ""' <<< "$PARAMS")
+            if [ -n "$INSTALL_CMD" ]; then
+              echo
+              echo "### Install"
+              echo
+              echo "\`\`\`bash"
+              echo "${INSTALL_CMD}@${VERSION}"
+              echo "\`\`\`"
+            fi
             echo
             echo "### 说明"
             echo
