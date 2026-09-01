@@ -20,8 +20,13 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Guard ref format
-      # 用 sh 而非 bash:本 action 会在 alpine 等无 bash 的 container job 里首先执行
+    # 暂存工厂仓本地 actions:actions/checkout 会 clean 整个 workspace,而 runner 在
+    # job 的 post 阶段会重新加载本地 action 元数据,被清掉会报
+    # "Can't find action.yml ... Did you forget to run actions/checkout"。
+    # 暂存到 RUNNER_TEMP(workspace 之外),检出目标仓后还原。
+    # posix 分支用 sh:兼容 alpine 等无 bash 的 container job;windows 分支用 pwsh。
+    - name: Guard ref + stash factory actions (posix)
+      if: runner.os != 'Windows'
       shell: sh
       env:
         REF: ${{ inputs.ref }}
@@ -31,6 +36,26 @@ runs:
           echo "✗ illegal ref: contains whitespace" >&2
           exit 1
         fi
+        rm -rf "$RUNNER_TEMP/factory-actions"
+        if [ -d .github/actions ]; then
+          mkdir -p "$RUNNER_TEMP/factory-actions"
+          cp -r .github/actions "$RUNNER_TEMP/factory-actions/"
+        fi
+
+    - name: Guard ref + stash factory actions (windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        REF: ${{ inputs.ref }}
+      run: |
+        if ($env:REF -match '\s') { Write-Error "✗ illegal ref: contains whitespace"; exit 1 }
+        $stash = Join-Path $env:RUNNER_TEMP 'factory-actions'
+        if (Test-Path $stash) { Remove-Item -Recurse -Force $stash }
+        if (Test-Path '.github/actions') {
+          New-Item -ItemType Directory -Force -Path $stash | Out-Null
+          Copy-Item -Recurse '.github/actions' $stash
+        }
+
     - name: Checkout ${{ inputs.repository }} @ ${{ inputs.ref }}
       uses: actions/checkout@v4
       with:
@@ -38,3 +63,22 @@ runs:
         ref: ${{ inputs.ref }}
         token: ${{ inputs.token }}
         fetch-depth: ${{ inputs.fetch-depth }}
+
+    - name: Restore factory actions (posix)
+      if: runner.os != 'Windows'
+      shell: sh
+      run: |
+        if [ -d "$RUNNER_TEMP/factory-actions/actions" ]; then
+          mkdir -p .github/actions
+          cp -r "$RUNNER_TEMP/factory-actions/actions/." .github/actions/
+        fi
+
+    - name: Restore factory actions (windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $stash = Join-Path $env:RUNNER_TEMP 'factory-actions/actions'
+        if (Test-Path $stash) {
+          New-Item -ItemType Directory -Force -Path '.github/actions' | Out-Null
+          Copy-Item -Recurse -Force "$stash\*" '.github/actions/'
+        }
