@@ -102,8 +102,13 @@ jobs:
         run: |
           set -euo pipefail
           # 逐行读取,不能用 for + 词分割:supports 多词 entry(如 "-r build"),
-          # 词分割会把它拆成 "-r" 和 "build" 两条错误命令
+          # 词分割会把它拆成 "-r" 和 "build" 两条错误命令。
+          # 另外必须剥 \r:Git Bash 下 jq→read 链路实测会给行尾带 \r,
+          # 导致 pnpm 找名为 "build\r" 的 script(None of the selected packages has a "build\r" script)
           while IFS= read -r s; do
+            s="${s%$'\r'}"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
             [[ -n "$s" ]] || continue
             echo "== pnpm $s =="
             pnpm $s
