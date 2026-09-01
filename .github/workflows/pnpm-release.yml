@@ -13,6 +13,7 @@ name: pipeline/pnpm-release
 #   "verify": "<bash,可选>",                        # 发布门禁(资产完整性校验等)
 #   "publish_mode": "recursive",                   # recursive=pnpm -r publish | packages=按目录逐个
 #   "packages": ["packages/kit","packages/cli"],   # packages 模式必填,按依赖拓扑序排列
+#   "publish_gates": [{"before_dir":"packages/cli","script":"<bash>"}],  # 可选:发布某包前执行(cwd=该包目录)
 #   "npm_access": "public",
 #   "release_name": "hunter-mate",                 # GitHub Release 标题前缀
 #   "post_dispatches": [                           # publish 成功后触发的下游事件(发回工厂 router)
@@ -186,6 +187,12 @@ jobs:
             if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
               echo "${NAME}@${VER} 已发布,跳过"
               continue
+            fi
+            # publish gate:发布该包前执行的自定义 bash(如 fresh-install 冒烟)
+            GATE=$(jq -r --arg d "$dir" '.publish_gates // [] | map(select(.before_dir == $d)) | .[0].script // empty' <<< "$PARAMS")
+            if [ -n "$GATE" ]; then
+              echo "== publish gate for $dir =="
+              (cd "$dir" && bash -euo pipefail -c "$GATE")
             fi
             echo "== publishing ${NAME}@${VER} =="
             (cd "$dir" && pnpm publish --access "$ACCESS" --no-git-checks)
