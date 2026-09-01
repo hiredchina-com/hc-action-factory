@@ -21,6 +21,9 @@ jobs:
     name: factory self-test
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (本地 action 依赖)
+        uses: actions/checkout@v4
+
       - name: Show trigger context
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}

@@ -71,6 +71,8 @@ jobs:
       version: ${{ steps.diff.outputs.version }}
       prev_version: ${{ steps.diff.outputs.prev_version }}
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -112,6 +114,8 @@ jobs:
     if: needs.detect.outputs.changed == '1' || inputs.force == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -237,6 +241,8 @@ jobs:
     needs: [detect, publish]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -302,6 +308,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - name: Resolve final state
         id: state
         env:

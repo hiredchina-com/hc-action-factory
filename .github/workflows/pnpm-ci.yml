@@ -57,6 +57,8 @@ jobs:
     name: begin (status pending + notify start)
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/report-status
         with:
           token: ${{ secrets.FACTORY_PAT }}
@@ -89,6 +91,8 @@ jobs:
       matrix:
         node: ${{ fromJSON(inputs.params_json).node || fromJSON('["22"]') }}
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -153,6 +157,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - name: Resolve final state
         id: state
         env:

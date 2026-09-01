@@ -74,6 +74,8 @@ jobs:
       GH_HOST: "http://localhost:4200"
       SKIP_OAUTH: "false"
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ env.TARGET_REPO }}
@@ -120,6 +122,8 @@ jobs:
       GH_HOST: "http://localhost:4200"
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ env.TARGET_REPO }}
@@ -153,6 +157,8 @@ jobs:
     env:
       GH_HOST: "http://localhost:4200"
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ env.TARGET_REPO }}

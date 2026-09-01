@@ -50,6 +50,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(inputs.params_json).timeout || 30 }}
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - name: Report pending
         uses: ./.github/actions/report-status
         with:

@@ -48,6 +48,8 @@ jobs:
     name: Bash (shellcheck + shfmt)
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -81,6 +83,8 @@ jobs:
     name: PowerShell (PSScriptAnalyzer + parse)
     runs-on: windows-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -132,6 +136,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout factory repo (local action dependency)
+        uses: actions/checkout@v4
       - name: Resolve final state
         id: state
         env:
