@@ -57,6 +57,17 @@ jobs:
         container: ${{ fromJSON(inputs.params_json).containers }}
     container: ${{ matrix.container }}
     steps:
+      # 必须先装 git 再 checkout:容器镜像默认无 git,actions/checkout 会
+      # 因找不到 git 可执行文件而失败(时序 bug:原实现把安装放在 checkout 之后)。
+      # jq 供后续步骤解析 params_json。步骤本身不需要仓库文件,可最先执行。
+      - name: Install git + curl + jq in container (before checkout)
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y --no-install-recommends git curl jq ca-certificates bash sudo
+          elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache git curl jq ca-certificates bash sudo
+          fi
+
       - name: Checkout factory repo (local action dependency)
         uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-private
@@ -65,14 +76,6 @@ jobs:
           ref: ${{ inputs.sha }}
           token: ${{ secrets.FACTORY_PAT }}
           fetch-depth: "1"
-
-      - name: Install sudo + git + curl in container
-        run: |
-          if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y --no-install-recommends sudo git curl ca-certificates bash
-          elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache sudo git curl ca-certificates bash
-          fi
 
       - name: Run bootstrap
         env:
