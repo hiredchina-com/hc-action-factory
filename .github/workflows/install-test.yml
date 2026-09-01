@@ -78,13 +78,17 @@ jobs:
           fetch-depth: "1"
 
       - name: Run bootstrap
+        shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
+          # bootstrap 内部用 gh repo clone 私有仓,需要带权限的 token
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         run: |
           set -euo pipefail
           jq -r '.bootstrap_sh' <<< "$PARAMS" | bash -euo pipefail
 
       - name: Verify installed tools
+        shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
         run: |
@@ -99,6 +103,7 @@ jobs:
         shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         run: |
           set -euo pipefail
           jq -r '.smoke_sh' <<< "$PARAMS" | bash -euo pipefail
@@ -121,13 +126,16 @@ jobs:
           fetch-depth: "1"
 
       - name: Run bootstrap
+        shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         run: |
           set -euo pipefail
           jq -r '.bootstrap_sh' <<< "$PARAMS" | bash -euo pipefail
 
       - name: Verify installed tools
+        shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
         run: |
@@ -142,6 +150,7 @@ jobs:
         shell: bash
         env:
           PARAMS: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         run: |
           set -euo pipefail
           jq -r '.smoke_sh' <<< "$PARAMS" | bash -euo pipefail
@@ -170,6 +179,7 @@ jobs:
         shell: pwsh
         env:
           PARAMS: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
         run: |
           $script = ($env:PARAMS | ConvertFrom-Json).bootstrap_ps1
           Invoke-Expression $script
