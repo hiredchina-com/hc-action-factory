@@ -101,10 +101,13 @@ jobs:
           PARAMS: ${{ inputs.params_json }}
         run: |
           set -euo pipefail
-          for s in $(jq -r '.scripts[]?' <<< "$PARAMS"); do
+          # 逐行读取,不能用 for + 词分割:supports 多词 entry(如 "-r build"),
+          # 词分割会把它拆成 "-r" 和 "build" 两条错误命令
+          while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
             echo "== pnpm $s =="
             pnpm $s
-          done
+          done < <(jq -r '.scripts[]?' <<< "$PARAMS")
 
       - name: Verify (pwsh)
         if: ${{ fromJSON(inputs.params_json).verify_pwsh != null }}
