@@ -20,5 +20,14 @@ runs:
       run: |
         [[ -z "$WEBHOOK" ]] && { echo "no webhook configured, skip"; exit 0; }
         PAYLOAD=$(jq -nc --arg c "$CONTENT" '{msgtype:"markdown",markdown:{content:$c}}')
-        curl -fsS --max-time 10 -H 'Content-Type: application/json' \
-          -d "$PAYLOAD" "$WEBHOOK" > /dev/null || echo "notify failed (non-fatal)" >&2
+        for attempt in 1 2 3; do
+          RESP=$(curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" "$WEBHOOK" 2>/dev/null || true)
+          if [[ "$RESP" == *'"errcode":0'* ]]; then
+            echo "✓ notified (attempt $attempt)"
+            exit 0
+          fi
+          echo "notify attempt $attempt failed: ${RESP:-no response}" >&2
+          sleep 3
+        done
+        echo "notify failed after 3 attempts (non-fatal)" >&2
