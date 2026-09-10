@@ -278,7 +278,10 @@ jobs:
             echo
             echo "### Commits"
             echo
-            git log --pretty=format:"- %s (%h)" "$RANGE" | head -50
+            # 用 -n 50 截断而非 | head -50:commits 超过 50 时 head 提前关管道,
+            # git log 收 SIGPIPE(141),pipefail+set -e 直接中断本步,
+            # 导致 npm 已发但 GitHub Release/tag 缺失(hunter-mate 0.1.8 实测)
+            git log -n 50 --pretty=format:"- %s (%h)" "$RANGE"
             echo
             INSTALL_CMD=$(jq -r '.install_cmd // ""' <<< "$PARAMS")
             if [ -n "$INSTALL_CMD" ]; then
