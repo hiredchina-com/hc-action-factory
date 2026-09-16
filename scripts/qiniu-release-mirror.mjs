@@ -43,6 +43,8 @@ const BUCKET = arg('bucket', 'hcweb-temp-file');
 const KEY_PREFIX = arg('key-prefix', 'hunter-mate-releases').replace(/\/+$/, '');
 const KEEP = Math.max(1, parseInt(arg('keep', '5'), 10) || 5);
 const BASE_URL = arg('base-url', 'https://tempfile.hiredchina.com').replace(/\/+$/, '');
+// 上传主机必须与 bucket 所在区域一致:hcweb-temp-file 在 z2(华南),默认 up-z2
+const UPLOAD_HOST = arg('upload-host', 'up-z2.qiniup.com');
 
 const AK = process.env.QINIU_ACCESS_KEY || '';
 const SK = process.env.QINIU_SECRET_KEY || '';
@@ -75,7 +77,7 @@ async function uploadFile(key, filePath) {
   form.set('token', uploadToken(key));
   form.set('key', key);
   form.set('file', new Blob([fs.readFileSync(filePath)]));
-  const res = await fetch('https://upload.qiniup.com', { method: 'POST', body: form });
+  const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form });
   if (!res.ok) throw new Error(`upload ${key} 失败: HTTP ${res.status} ${await res.text()}`);
   return res.json();
 }
