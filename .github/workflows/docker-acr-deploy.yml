@@ -171,6 +171,13 @@ jobs:
           SERVER_HOST=$(jq -r '.server_host' <<< "$PARAMS")
           LOCAL_TAG=$(jq -r '.local_tag' <<< "$PARAMS")
           REMOTE_SCRIPT=$(jq -r '.remote_script' <<< "$PARAMS")
+          # remote_script 模板变量($SHA/$REMOTE_IMAGE)在 runner 侧展开:heredoc 单次
+          # 展开只替换模板里的直接引用,插入的 $REMOTE_SCRIPT 文本不会被二次扫描,
+          # 不替换则原样到达远端被 set -u 杀掉(2026-09-16 dev-ops 实机事故,line 7 SHA unbound)
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//\${SHA}/$SHA}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//\$SHA/$SHA}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//\${REMOTE_IMAGE}/$REMOTE_IMAGE}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//\$REMOTE_IMAGE/$REMOTE_IMAGE}"
 
           # 服务器侧登录 ACR;凭证经 stdin 管道,不落远程命令行/进程列表
           printf '%s' "$ACR_PASSWORD" | ssh "$SERVER_HOST" \
