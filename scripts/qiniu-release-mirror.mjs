@@ -15,9 +15,9 @@
 //
 // 用法:
 //   node scripts/qiniu-release-mirror.mjs \
-//     --dir packages/cli --version 0.1.14 \
-//     --bucket hcweb-temp-file --key-prefix hunter-mate-releases \
-//     --keep 5 --base-url https://tempfile.hiredchina.com
+//     --dir packages/cli --version 0.1.15 \
+//     --bucket hiredchina --key-prefix hunter-mate-releases \
+//     --keep 5 --base-url https://image.hiredchina.com
 //
 // 环境变量(工厂仓 GitHub Secrets):
 //   QINIU_ACCESS_KEY / QINIU_SECRET_KEY
@@ -39,11 +39,11 @@ function arg(name, dflt) {
 }
 const PKG_DIR = arg('dir', 'packages/cli');
 const VERSION = arg('version', '');
-const BUCKET = arg('bucket', 'hcweb-temp-file');
+const BUCKET = arg('bucket', 'hiredchina');
 const KEY_PREFIX = arg('key-prefix', 'hunter-mate-releases').replace(/\/+$/, '');
 const KEEP = Math.max(1, parseInt(arg('keep', '5'), 10) || 5);
-const BASE_URL = arg('base-url', 'https://tempfile.hiredchina.com').replace(/\/+$/, '');
-// 上传主机必须与 bucket 所在区域一致:hcweb-temp-file 在 z2(华南),默认 up-z2
+const BASE_URL = arg('base-url', 'https://image.hiredchina.com').replace(/\/+$/, '');
+// 上传主机必须与 bucket 所在区域一致:hiredchina/hcweb-temp-file 都在 z2(华南),默认 up-z2
 const UPLOAD_HOST = arg('upload-host', 'up-z2.qiniup.com');
 
 const AK = process.env.QINIU_ACCESS_KEY || '';
@@ -138,19 +138,27 @@ try {
   await uploadFile(`${KEY_PREFIX}/latest.json`, manifestPath);
   console.log(`✓ uploaded ${BUCKET}:${KEY_PREFIX}/latest.json = ${JSON.stringify(manifest)}`);
 
-  // 4) 清理:semver 降序,保留最近 KEEP 个
-  const all = await listTgz();
-  all.sort((a, b) => b.ver.localeCompare(a.ver, undefined, { numeric: true }));
-  const stale = all.slice(KEEP);
-  for (const it of stale) {
-    await deleteKey(it.key);
-    console.log(`✓ pruned ${it.key} (keep=${KEEP})`);
+  // 4) 清理:semver 降序,保留最近 KEEP 个(管理接口不可用时不阻断——上传主链已完成)
+  try {
+    const all = await listTgz();
+    all.sort((a, b) => b.ver.localeCompare(a.ver, undefined, { numeric: true }));
+    const stale = all.slice(KEEP);
+    for (const it of stale) {
+      await deleteKey(it.key);
+      console.log(`✓ pruned ${it.key} (keep=${KEEP})`);
+    }
+    if (!stale.length) console.log(`✓ 无需清理(现存 ${all.length} ≤ keep=${KEEP})`);
+  } catch (err) {
+    console.warn(`⚠ 清理跳过(管理接口不可用,${err.message})`);
   }
-  if (!stale.length) console.log(`✓ 无需清理(现存 ${all.length} ≤ keep=${KEEP})`);
 
-  // 5) CDN 刷新(latest.json 覆盖必须刷,否则边缘节点还是旧清单)
-  await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`]);
-  console.log('✓ CDN refreshed');
+  // 5) CDN 刷新(latest.json 覆盖必须刷,否则边缘节点还是旧清单;失败降级为告警)
+  try {
+    await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`]);
+    console.log('✓ CDN refreshed');
+  } catch (err) {
+    console.warn(`⚠ CDN 刷新失败(可能读到旧 latest.json,${err.message})`);
+  }
   console.log(`✓ mirror done: ${BASE_URL}/${KEY_PREFIX}/latest.json`);
 } catch (err) {
   console.error(`✗ ${err.message}`);
