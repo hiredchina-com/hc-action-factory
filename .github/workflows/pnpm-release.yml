@@ -19,6 +19,13 @@ name: pipeline/pnpm-release
 #   "post_dispatches": [                           # publish 成功后触发的下游事件(发回工厂 router)
 #     {"event_type":"sync-deps","payload":{"package":"kit","source_repository":"hiredchina-com/chromepilot","version_from":"packages/kit"}}
 #   ],
+#   "cdn_mirror": {                                # 可选:发布后把包 tgz 镜像到七牛 CDN(供 CLI 自更新回退下载)
+#     "package_dir": "packages/cli",               # npm pack 的目录
+#     "bucket": "hcweb-temp-file",
+#     "key_prefix": "hunter-mate-releases",
+#     "keep": 5,                                   # 只保留最近 N 个版本 tgz
+#     "base_url": "https://tempfile.hiredchina.com"
+#   },                                             # 需要工厂仓 Secrets: QINIU_ACCESS_KEY / QINIU_SECRET_KEY
 #   "status_context": "factory/pnpm-release",
 #   "notify": {"start": true, "finish": "always"}
 # }
@@ -304,6 +311,50 @@ jobs:
             --target "$SHA" \
             --title "${RELEASE_NAME} ${VERSION}" \
             --notes-file release_notes.md
+
+  cdn_mirror:
+    name: Mirror tgz to Qiniu CDN (optional)
+    # CLI 自更新回退通道(FID-102):npm 发布后把 tgz + latest.json 镜像到七牛,
+    # 只保留最近 keep 个版本。镜像失败不阻断 release(continue-on-error),
+    # 也不并入 finalize 状态——它是增强通道,不是发布正确性的一部分。
+    needs: [detect, publish]
+    if: ${{ needs.publish.result == 'success' && fromJSON(inputs.params_json).cdn_mirror != null }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout factory repo (mirror script)
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-private
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: npm pack + upload + prune + refresh
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          MIRROR: ${{ toJSON(fromJSON(inputs.params_json).cdn_mirror) }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -uo pipefail
+          if [ -z "${QINIU_ACCESS_KEY:-}" ] || [ -z "${QINIU_SECRET_KEY:-}" ]; then
+            echo "⚠ 工厂仓未配置 QINIU_ACCESS_KEY/QINIU_SECRET_KEY Secrets,跳过 CDN 镜像(CLI 回退通道不可用,但不影响发布)"
+            exit 0
+          fi
+          node scripts/qiniu-release-mirror.mjs \
+            --dir "$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")" \
+            --version "$VERSION" \
+            --bucket "$(jq -r '.bucket // "hcweb-temp-file"' <<< "$MIRROR")" \
+            --key-prefix "$(jq -r '.key_prefix // "releases"' <<< "$MIRROR")" \
+            --keep "$(jq -r '.keep // 5' <<< "$MIRROR")" \
+            --base-url "$(jq -r '.base_url // "https://tempfile.hiredchina.com"' <<< "$MIRROR")"
 
   finalize:
     name: finalize (status + notify)
