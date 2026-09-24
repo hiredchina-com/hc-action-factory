@@ -7,9 +7,12 @@
 // 行为:
 //   1. npm pack <package_dir> 产出 <name>-<version>.tgz
 //   2. 上传到 <bucket>:<key_prefix>/<tgz>
-//   3. 写并上传 <key_prefix>/latest.json = {version, tgz, publishedAt}
-//   4. 列出现有 *.tgz,semver 降序,删除超出 --keep 的旧版本
-//   5. CDN 刷新 latest.json 与 tgz URL(覆盖旧缓存)
+//   3. 镜像原生依赖(FID-116):发布包 dependencies/optionalDependencies 里的包
+//      及一层内带 install 脚本的原生传递依赖,npm tarball 传到 <key_prefix>/native/,
+//      登记进 latest.json.nativeDeps,供国内安装路径零 registry 下载
+//   4. 写并上传 <key_prefix>/latest.json = {version, tgz, publishedAt, nativeDeps?}
+//   5. 列出现有主包 *.tgz(native/ 子目录不参与),semver 降序,删除超出 --keep 的旧版本
+//   6. CDN 刷新 latest.json 与 tgz URL(覆盖旧缓存)
 //
 // 退出码:任何失败 exit 1(发布主流程里本步骤 continue-on-error,失败不阻断 release)。
 //
@@ -92,7 +95,8 @@ async function listTgz() {
   const items = data.items || [];
   return items
     .map((it) => it.key)
-    .filter((k) => k.endsWith('.tgz'))
+    // 只统计主包 tgz;native/ 子目录是原生依赖镜像,独立生命周期,不参与主包清理
+    .filter((k) => k.endsWith('.tgz') && !k.includes('/native/'))
     .map((k) => {
       const m = k.match(/-(\d+\.\d+\.\d+)\.tgz$/);
       return m ? { key: k, ver: m[1] } : null;
@@ -117,6 +121,81 @@ async function cdnRefresh(urls) {
   if (!res.ok) throw new Error(`CDN refresh 失败: HTTP ${res.status} ${await res.text()}`);
 }
 
+// ---------- 原生依赖镜像(FID-116:bundle 后用户机器只装原生外置模块) ----------
+// 把发布包 dependencies + optionalDependencies 里的包(及其一层内带 install
+// 脚本的传递依赖,如 better-sqlite3 → node-addon-api)的 npm tarball 一并镜像到
+// <key-prefix>/native/,并登记进 latest.json.nativeDeps,供国内安装路径零
+// registry 下载。任何一个失败不阻断主包镜像(降级告警,回退走 npm registry)。
+async function npmView(name, range, fields) {
+  const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name).replace('%40', '@')}/${encodeURIComponent(range)}`, {
+    headers: { accept: 'application/json' },
+  });
+  if (!res.ok) throw new Error(`npm view ${name}@${range}: HTTP ${res.status}`);
+  const d = await res.json();
+  const out = {};
+  for (const f of fields) out[f] = d[f];
+  return out;
+}
+
+async function downloadTo(url, dest) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download ${url}: HTTP ${res.status}`);
+  fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+}
+
+async function mirrorNativeDeps(pkgDir, tmp) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
+  const nativeDeps = {};
+  const urls = [];
+
+  async function mirrorOne(name, range, optional) {
+    try {
+      const info = await npmView(name, range, ['version', 'dist']);
+      const ver = info.version;
+      const tarball = info.dist && info.dist.tarball;
+      if (!ver || !tarball) throw new Error('缺 version/dist.tarball');
+      const fname = `${name.replace('/', '-').replace('@', '')}-${ver}.tgz`;
+      const key = `${KEY_PREFIX}/native/${fname}`;
+      const local = path.join(tmp, fname);
+      await downloadTo(tarball, local);
+      await uploadFile(key, local);
+      nativeDeps[name] = { version: ver, tgz: `native/${fname}`, optional: !!optional };
+      urls.push(`${BASE_URL}/${key}`);
+      console.log(`✓ native mirrored ${name}@${ver} -> ${key}`);
+      // 一层递归:该包的 dependencies 里带 install/preinstall 脚本的原生包
+      const childDeps = (await npmView(name, ver, ['dependencies'])).dependencies || {};
+      for (const [cn, cr] of Object.entries(childDeps)) {
+        try {
+          const cs = await npmView(cn, cr, ['scripts']);
+          const s = cs.scripts || {};
+          if (!s.install && !s.preinstall) continue; // 纯 JS 传递依赖,bundle/安装期不需要单独镜像
+          if (nativeDeps[cn]) continue;
+          const cinfo = await npmView(cn, cr, ['version', 'dist']);
+          const cver = cinfo.version;
+          const ctar = cinfo.dist && cinfo.dist.tarball;
+          if (!cver || !ctar) continue;
+          const cfname = `${cn.replace('/', '-').replace('@', '')}-${cver}.tgz`;
+          const ckey = `${KEY_PREFIX}/native/${cfname}`;
+          const clocal = path.join(tmp, cfname);
+          await downloadTo(ctar, clocal);
+          await uploadFile(ckey, clocal);
+          nativeDeps[cn] = { version: cver, tgz: `native/${cfname}`, transitive: true };
+          urls.push(`${BASE_URL}/${ckey}`);
+          console.log(`✓ native mirrored(传递) ${cn}@${cver} -> ${ckey}`);
+        } catch (err) {
+          console.warn(`⚠ native 传递依赖 ${cn}@${cr} 镜像跳过: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠ native ${name}@${range} 镜像跳过: ${err.message}`);
+    }
+  }
+
+  for (const [name, range] of Object.entries(pkg.dependencies || {})) await mirrorOne(name, range, false);
+  for (const [name, range] of Object.entries(pkg.optionalDependencies || {})) await mirrorOne(name, range, true);
+  return { nativeDeps, urls };
+}
+
 // ---------- main ----------
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qiniu-mirror-'));
 try {
@@ -131,8 +210,12 @@ try {
   await uploadFile(key, tgzPath);
   console.log(`✓ uploaded ${BUCKET}:${key}`);
 
+  // 2.5) 原生依赖镜像(FID-116;失败降级告警,主包镜像不受影响)
+  const { nativeDeps, urls: nativeUrls } = await mirrorNativeDeps(PKG_DIR, tmp);
+
   // 3) latest.json(tgz 上传成功后才写,避免指向不存在的包)
   const manifest = { version: VERSION, tgz: out, publishedAt: new Date().toISOString() };
+  if (Object.keys(nativeDeps).length) manifest.nativeDeps = nativeDeps;
   const manifestPath = path.join(tmp, 'latest.json');
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
   await uploadFile(`${KEY_PREFIX}/latest.json`, manifestPath);
@@ -154,7 +237,7 @@ try {
 
   // 5) CDN 刷新(latest.json 覆盖必须刷,否则边缘节点还是旧清单;失败降级为告警)
   try {
-    await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`]);
+    await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`, ...nativeUrls]);
     console.log('✓ CDN refreshed');
   } catch (err) {
     console.warn(`⚠ CDN 刷新失败(可能读到旧 latest.json,${err.message})`);
