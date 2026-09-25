@@ -46,7 +46,7 @@ install_job() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>${HOME}/.local/bin:${HOME}/.n/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>
