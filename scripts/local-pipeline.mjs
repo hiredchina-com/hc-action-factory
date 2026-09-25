@@ -110,7 +110,9 @@ function run(cmd, args, { allowFail = false, env, cwd } = {}) {
   }
   const out = { code: r.status ?? 1, stdout: r.stdout || "", stderr: r.stderr || "" };
   if (out.code !== 0 && !allowFail) {
-    throw new Error(`${cmd} ${args.join(" ")} rc=${out.code}\n${out.stderr.trim().slice(0, 800)}`);
+    // pnpm/npm 把失败详情写 stdout,合并两流取尾部保证诊断价值
+    const tail = (out.stdout + "\n" + out.stderr).trim().slice(-1500);
+    throw new Error(`${cmd} ${args.join(" ").slice(0, 120)} rc=${out.code}\n${tail}`);
   }
   return out;
 }
