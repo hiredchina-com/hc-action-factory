@@ -21,15 +21,46 @@ node scripts/auto-merge-dev.mjs --repo hunter-mate    # 单仓
 node --test scripts/auto-merge-dev.test.mjs           # 测试(全本地,4 例)
 ```
 
+## scripts/local-pipeline.mjs
+
+本地 CI/Release 运行器(参数契约与原 dispatcher 发工厂仓的 params 一致):
+
+- **CI**:main 新提交 → install → lint/typecheck/test/build → verify 门禁 →
+  记 state(同 sha 跳过);失败开/追加 gh issue,成功回写 commit status;
+- **Release**:version_file 版本 > 最新 v* tag → 同 CI 序列 → 逐包 publish
+  (拓扑序、skip 已存在)→ GitHub Release/tag → 七牛镜像 → npmmirror 同步;
+- secrets 走本机环境,放工厂 worktree `.env.local`(gitignored):
+  `NPM_TOKEN`(必需)、`QINIU_ACCESS_KEY/SECRET`(七牛镜像)、
+  `WECOM_WEBHOOK_URL`(企微通知);缺 NPM_TOKEN 时 release 打 BLOCKED
+  并开 issue,CI 不受影响;
+- 测试:`node --test scripts/local-pipeline.test.mjs`(3 例,全本地)。
+
+```bash
+node scripts/local-pipeline.mjs                 # CI+release 一轮(全注册)
+node scripts/local-pipeline.mjs --repo hunter-mate --ci-only
+node scripts/local-pipeline.mjs --dry-run       # 跑到 publish 前停
+```
+
+## scripts/npmmirror-sync.mjs
+
+npm publish 后对 npmmirror 发 on-demand 同步(防其爬虫漏同步导致国内
+安装 E404,`@hunter-mate/sync-entities` 9 天漏同步事故):
+`node scripts/npmmirror-sync.mjs <pkg> [pkg...]`。已被 local-pipeline
+在发布后自动调用。
+
 ## scripts/install-automerge-watcher.sh
 
-把合并轮询装成 launchd 守护(默认每 180s 一轮,日志
-`~/Library/Logs/factory-automerge.log`):
+把合并轮询装成 launchd 守护(两个 job,幂等重装):
 
 ```bash
 scripts/install-automerge-watcher.sh             # 安装/重装
 scripts/install-automerge-watcher.sh --uninstall # 卸载
 ```
+
+- `com.hiredchina.factory-automerge`:每 180s 合并轮询,
+  日志 `~/Library/Logs/factory-automerge.log`;
+- `com.hiredchina.factory-pipeline`:每 300s CI/release 轮询,
+  日志 `~/Library/Logs/factory-pipeline.log`。
 
 ## scripts/qiniu-release-mirror.mjs
 
