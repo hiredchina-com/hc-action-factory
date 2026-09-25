@@ -44,6 +44,21 @@ const DEFAULT_REPOS = [
     remote: "git@github.com:hiredchina-com/hunter-mate-harness.git",
     github: "hiredchina-com/hunter-mate-harness",
   },
+  {
+    name: "chromepilot",
+    remote: "git@github.com:hiredchina-com/chromepilot.git",
+    github: "hiredchina-com/chromepilot",
+  },
+  {
+    name: "dev-ops",
+    remote: "git@github.com:hiredchina-com/dev-ops.git",
+    github: "hiredchina-com/dev-ops",
+  },
+  {
+    name: "job-pages",
+    remote: "git@github.com:hiredchina-com/job-pages.git",
+    github: "hiredchina-com/job-pages",
+  },
 ];
 
 const CACHE_ROOT =

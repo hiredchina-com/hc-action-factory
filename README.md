@@ -8,7 +8,8 @@ runner 依赖(org 账单/额度故障、runner 饥饿都会让 GH 侧 CI 整体�
 dev → main 自动合并的 **SSOT**(原 `.github/workflows/auto-merge-dev.yml`
 已从 hunter-mate / hunter-mate-harness 移除)。
 
-- 注册仓:hunter-mate、hunter-mate-harness(dev → main)
+- 注册仓:hunter-mate、hunter-mate-harness、chromepilot、dev-ops、job-pages
+  (dev → main;FID-117 iter2 起全覆盖)
 - 每仓一个持久缓存克隆(`.cache/auto-merge/<name>`),与工作区完全隔离
 - 语义与原 GH workflow 一致:`merge --no-edit` + push;冲突时 abort 并
   开/追加 gh issue;已最新跳过;推送竞态自动重试一次
