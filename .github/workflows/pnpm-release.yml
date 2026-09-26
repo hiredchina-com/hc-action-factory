@@ -325,14 +325,9 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      # FID-024 iter18: 工厂仓检出到 factory/ 子目录;目标仓检出用 clean:false ——
-      # checkout-private 的内层 actions/checkout 默认 clean 会 git clean -ffdx 整个
-      # workspace,factory/ 被连带清掉(实证 MODULE_NOT_FOUND);本 job 不用本地
-      # composite action,无需 stash 舞步。mirror 脚本 cwd=根,--dir 用根相对路径。
-      - name: Checkout factory repo (mirror script)
-        uses: actions/checkout@v4
-        with:
-          path: factory
+      # FID-024 iter18: 镜像脚本经 gh api 按内容取到 workspace(actions/checkout 在目标
+      # 路径非空时无条件 "Deleting the contents of workspace",clean:false 也救不了,
+      # 工厂仓任何检出顺序都会被清;三轮实证)。脚本 cwd=根,--dir 用根相对路径。
       - name: Checkout target repo
         uses: actions/checkout@v4
         with:
@@ -340,7 +335,14 @@ jobs:
           ref: ${{ inputs.sha }}
           token: ${{ secrets.FACTORY_PAT }}
           fetch-depth: "1"
-          clean: false
+
+      - name: Fetch mirror script (content-addressed via gh api)
+        env:
+          GH_TOKEN: ${{ secrets.FACTORY_PAT }}
+        run: |
+          gh api "repos/hiredchina-com/hc-action-factory/contents/scripts/qiniu-release-mirror.mjs?ref=main" \
+            -H "Accept: application/vnd.github.raw" > qiniu-release-mirror.mjs
+          test -s qiniu-release-mirror.mjs
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -359,7 +361,7 @@ jobs:
             echo "⚠ 工厂仓未配置 QINIU_ACCESS_KEY/QINIU_SECRET_KEY Secrets,跳过 CDN 镜像(CLI 回退通道不可用,但不影响发布)"
             exit 0
           fi
-          node factory/scripts/qiniu-release-mirror.mjs \
+          node qiniu-release-mirror.mjs \
             --dir "$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")" \
             --version "$VERSION" \
             --bucket "$(jq -r '.bucket // "hcweb-temp-file"' <<< "$MIRROR")" \
