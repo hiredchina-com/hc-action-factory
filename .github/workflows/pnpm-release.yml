@@ -145,6 +145,9 @@ jobs:
         with:
           node-version: ${{ fromJSON(inputs.params_json).node || '22' }}
           cache: pnpm
+          # FID-024 iter18: 默认只认根 pnpm-lock.yaml;monorepo 子包/非 pnpm 管理仓
+          # (如 hc-hw 依赖安装走 npm --prefix,锁文件在 bin/lib/telemetry/)经 params.cache_path 指定
+          cache-dependency-path: ${{ fromJSON(inputs.params_json).cache_path || 'pnpm-lock.yaml' }}
           registry-url: "https://registry.npmjs.org"
 
       - name: Install deps
