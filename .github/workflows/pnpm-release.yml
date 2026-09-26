@@ -325,8 +325,14 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
+      # FID-024 iter18: 工厂仓必须检出到子目录——checkout-private 会把目标仓检出到
+      # workspace 根并 clean 整个目录,scripts/ 在根检出时被整体清掉(FID-102 时代
+      # 侥幸成功,hc-hw 首发实证 MODULE_NOT_FOUND)。mirror 脚本 cwd=根,--dir 用
+      # 根相对路径即可。
       - name: Checkout factory repo (mirror script)
         uses: actions/checkout@v4
+        with:
+          path: factory
       - uses: ./.github/actions/checkout-private
         with:
           repository: ${{ inputs.repository }}
@@ -351,7 +357,7 @@ jobs:
             echo "⚠ 工厂仓未配置 QINIU_ACCESS_KEY/QINIU_SECRET_KEY Secrets,跳过 CDN 镜像(CLI 回退通道不可用,但不影响发布)"
             exit 0
           fi
-          node scripts/qiniu-release-mirror.mjs \
+          node factory/scripts/qiniu-release-mirror.mjs \
             --dir "$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")" \
             --version "$VERSION" \
             --bucket "$(jq -r '.bucket // "hcweb-temp-file"' <<< "$MIRROR")" \
