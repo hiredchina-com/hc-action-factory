@@ -325,20 +325,22 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      # FID-024 iter18: 工厂仓必须检出到子目录——checkout-private 会把目标仓检出到
-      # workspace 根并 clean 整个目录,scripts/ 在根检出时被整体清掉(FID-102 时代
-      # 侥幸成功,hc-hw 首发实证 MODULE_NOT_FOUND)。mirror 脚本 cwd=根,--dir 用
-      # 根相对路径即可。
+      # FID-024 iter18: 工厂仓检出到 factory/ 子目录;目标仓检出用 clean:false ——
+      # checkout-private 的内层 actions/checkout 默认 clean 会 git clean -ffdx 整个
+      # workspace,factory/ 被连带清掉(实证 MODULE_NOT_FOUND);本 job 不用本地
+      # composite action,无需 stash 舞步。mirror 脚本 cwd=根,--dir 用根相对路径。
       - name: Checkout factory repo (mirror script)
         uses: actions/checkout@v4
         with:
           path: factory
-      - uses: ./factory/.github/actions/checkout-private
+      - name: Checkout target repo
+        uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.sha }}
           token: ${{ secrets.FACTORY_PAT }}
           fetch-depth: "1"
+          clean: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
