@@ -10,11 +10,16 @@
 //   3. 镜像原生依赖(FID-116):发布包 dependencies/optionalDependencies 里的包
 //      及一层内带 install 脚本的原生传递依赖,npm tarball 传到 <key_prefix>/native/,
 //      登记进 latest.json.nativeDeps,供国内安装路径零 registry 下载
+//      (版本区间经 `npm view` 解析——registry URL 路径只收精确版本/tag,直接拼
+//      range 会 404,0.1.16 发布实证 better-sqlite3@^13.0.3 全跳过)
 //   4. 写并上传 <key_prefix>/latest.json = {version, tgz, publishedAt, nativeDeps?}
 //   5. 列出现有主包 *.tgz(native/ 子目录不参与),semver 降序,删除超出 --keep 的旧版本
-//   6. CDN 刷新 latest.json 与 tgz URL(覆盖旧缓存)
+//      (该 AK/SK 无 rsf/rs 管理权限,已知 401 降级,FID-102;清理靠 keep 上限容忍)
+//   6. CDN 刷新 latest.json 与 tgz URL(fusion /v2/tune/refresh;失败 exit 2 打
+//      ::warning:: 注解可见,不阻断 release——job 级 continue-on-error)
 //
-// 退出码:任何失败 exit 1(发布主流程里本步骤 continue-on-error,失败不阻断 release)。
+// 退出码:0 全绿;2 有降级(native 缺失/刷新失败/管理接口不可用),job 显红不阻断;
+//        1 硬失败(主包上传失败等)。
 //
 // 用法:
 //   node scripts/qiniu-release-mirror.mjs \
@@ -115,10 +120,17 @@ async function deleteKey(key) {
 }
 
 async function cdnRefresh(urls) {
+  // 官方路径是 /v2/tune/refresh(旧写 /refresh 会连接级失败,0.1.16 发布实证 fetch failed)
   const body = JSON.stringify({ urls });
-  const headers = { 'Content-Type': 'application/json', Authorization: qboxSign('POST', '/refresh', 'fusion.qiniu.com', { 'content-type': 'application/json' }, body) };
-  const res = await fetch('https://fusion.qiniu.com/refresh', { method: 'POST', headers, body });
-  if (!res.ok) throw new Error(`CDN refresh 失败: HTTP ${res.status} ${await res.text()}`);
+  const pathAndQuery = '/v2/tune/refresh';
+  const headers = { 'Content-Type': 'application/json', Authorization: qboxSign('POST', pathAndQuery, 'fusion.qiniu.com', { 'content-type': 'application/json' }, body) };
+  const res = await fetch(`https://fusion.qiniu.com${pathAndQuery}`, { method: 'POST', headers, body });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`CDN refresh 失败: HTTP ${res.status} ${text}`);
+  // fusion 业务错误也返回 HTTP 200 + body.code != 200,必须查体
+  const data = JSON.parse(text);
+  if (data.code !== 200) throw new Error(`CDN refresh 失败: code=${data.code} ${text}`);
+  return data;
 }
 
 // ---------- 原生依赖镜像(FID-116:bundle 后用户机器只装原生外置模块) ----------
@@ -127,14 +139,23 @@ async function cdnRefresh(urls) {
 // <key-prefix>/native/,并登记进 latest.json.nativeDeps,供国内安装路径零
 // registry 下载。任何一个失败不阻断主包镜像(降级告警,回退走 npm registry)。
 async function npmView(name, range, fields) {
-  const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name).replace('%40', '@')}/${encodeURIComponent(range)}`, {
-    headers: { accept: 'application/json' },
-  });
-  if (!res.ok) throw new Error(`npm view ${name}@${range}: HTTP ${res.status}`);
-  const d = await res.json();
-  const out = {};
-  for (const f of fields) out[f] = d[f];
-  return out;
+  // registry URL 路径(<name>/<version>)只接受精确版本或 dist-tag,semver range 会 404
+  // (0.1.16 发布实证 better-sqlite3@^13.0.3 → HTTP 404 全跳过)。版本解析交给 npm:
+  const spec = range ? `${name}@${range}` : name;
+  let out;
+  try {
+    out = execFileSync('npm', ['view', spec, '--json', '--fetch-retries=2', ...fields], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  } catch (err) {
+    const stderr = String(err.stderr || '').trim().split('\n').pop();
+    throw new Error(`npm view ${spec} 失败: ${stderr || err.message}`);
+  }
+  if (!out) throw new Error(`npm view ${spec}: 空输出`);
+  let d = JSON.parse(out);
+  // range 匹配多版本时 npm 输出升序数组(npm view node-addon-api@^8 实证 15 项),
+  // 取最后一项 = 最大满足版本(与 npm install 解析一致);单匹配输出裸对象/标量
+  if (Array.isArray(d)) d = d[d.length - 1];
+  // 单字段时 npm 直接输出该字段的值(可能是对象,如 dependencies 图),统一包一层
+  return fields.length === 1 ? { [fields[0]]: d } : d;
 }
 
 async function downloadTo(url, dest) {
@@ -147,6 +168,7 @@ async function mirrorNativeDeps(pkgDir, tmp) {
   const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
   const nativeDeps = {};
   const urls = [];
+  const skipped = []; // 声明了但镜像失败的 [{name, range, optional}]——main 里据此处打告警
 
   async function mirrorOne(name, range, optional) {
     try {
@@ -163,17 +185,17 @@ async function mirrorNativeDeps(pkgDir, tmp) {
       urls.push(`${BASE_URL}/${key}`);
       console.log(`✓ native mirrored ${name}@${ver} -> ${key}`);
       // 一层递归:该包的 dependencies 里带 install/preinstall 脚本的原生包
+      // (一次 npm view 取全 scripts+version+dist,省一次 registry 往返)
       const childDeps = (await npmView(name, ver, ['dependencies'])).dependencies || {};
       for (const [cn, cr] of Object.entries(childDeps)) {
         try {
-          const cs = await npmView(cn, cr, ['scripts']);
+          const cs = await npmView(cn, cr, ['scripts', 'version', 'dist']);
           const s = cs.scripts || {};
           if (!s.install && !s.preinstall) continue; // 纯 JS 传递依赖,bundle/安装期不需要单独镜像
           if (nativeDeps[cn]) continue;
-          const cinfo = await npmView(cn, cr, ['version', 'dist']);
-          const cver = cinfo.version;
-          const ctar = cinfo.dist && cinfo.dist.tarball;
-          if (!cver || !ctar) continue;
+          const cver = cs.version;
+          const ctar = cs.dist && cs.dist.tarball;
+          if (!cver || !ctar) throw new Error('缺 version/dist.tarball');
           const cfname = `${cn.replace('/', '-').replace('@', '')}-${cver}.tgz`;
           const ckey = `${KEY_PREFIX}/native/${cfname}`;
           const clocal = path.join(tmp, cfname);
@@ -184,20 +206,23 @@ async function mirrorNativeDeps(pkgDir, tmp) {
           console.log(`✓ native mirrored(传递) ${cn}@${cver} -> ${ckey}`);
         } catch (err) {
           console.warn(`⚠ native 传递依赖 ${cn}@${cr} 镜像跳过: ${err.message}`);
+          skipped.push({ name: cn, range: cr, optional: false });
         }
       }
     } catch (err) {
       console.warn(`⚠ native ${name}@${range} 镜像跳过: ${err.message}`);
+      skipped.push({ name, range, optional: !!optional });
     }
   }
 
   for (const [name, range] of Object.entries(pkg.dependencies || {})) await mirrorOne(name, range, false);
   for (const [name, range] of Object.entries(pkg.optionalDependencies || {})) await mirrorOne(name, range, true);
-  return { nativeDeps, urls };
+  return { nativeDeps, urls, skipped };
 }
 
 // ---------- main ----------
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qiniu-mirror-'));
+const degraded = []; // 降级项描述,末尾统一 ::warning:: + exit 2
 try {
   // 1) npm pack(产出名:<name>-<version>.tgz)
   const out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8' }).trim().split('\n').pop().trim();
@@ -210,8 +235,9 @@ try {
   await uploadFile(key, tgzPath);
   console.log(`✓ uploaded ${BUCKET}:${key}`);
 
-  // 2.5) 原生依赖镜像(FID-116;失败降级告警,主包镜像不受影响)
-  const { nativeDeps, urls: nativeUrls } = await mirrorNativeDeps(PKG_DIR, tmp);
+  // 2.5) 原生依赖镜像(FID-116;任一失败降级告警,主包镜像不受影响)
+  const { nativeDeps, urls: nativeUrls, skipped } = await mirrorNativeDeps(PKG_DIR, tmp);
+  for (const s of skipped) degraded.push(`native ${s.name}@${s.range} 未镜像(离线安装该依赖将回退 registry)`);
 
   // 3) latest.json(tgz 上传成功后才写,避免指向不存在的包)
   const manifest = { version: VERSION, tgz: out, publishedAt: new Date().toISOString() };
@@ -221,7 +247,8 @@ try {
   await uploadFile(`${KEY_PREFIX}/latest.json`, manifestPath);
   console.log(`✓ uploaded ${BUCKET}:${KEY_PREFIX}/latest.json = ${JSON.stringify(manifest)}`);
 
-  // 4) 清理:semver 降序,保留最近 KEEP 个(管理接口不可用时不阻断——上传主链已完成)
+  // 4) 清理:semver 降序,保留最近 KEEP 个(管理接口对该 AK/SK 无权限是已知限制
+  //    (FID-102,401 BadToken),降级告警;清理靠 keep 上限容忍)
   try {
     const all = await listTgz();
     all.sort((a, b) => b.ver.localeCompare(a.ver, undefined, { numeric: true }));
@@ -232,17 +259,25 @@ try {
     }
     if (!stale.length) console.log(`✓ 无需清理(现存 ${all.length} ≤ keep=${KEEP})`);
   } catch (err) {
-    console.warn(`⚠ 清理跳过(管理接口不可用,${err.message})`);
+    console.warn(`⚠ 清理跳过(${err.message})`);
+    degraded.push(`旧版本清理未执行(${err.message})`);
   }
 
-  // 5) CDN 刷新(latest.json 覆盖必须刷,否则边缘节点还是旧清单;失败降级为告警)
+  // 5) CDN 刷新(latest.json 覆盖必须刷,否则边缘节点还是旧清单;失败打告警显红)
   try {
-    await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`, ...nativeUrls]);
-    console.log('✓ CDN refreshed');
+    const r = await cdnRefresh([`${BASE_URL}/${key}`, `${BASE_URL}/${KEY_PREFIX}/latest.json`, ...nativeUrls]);
+    console.log(`✓ CDN refreshed (requestId=${r.requestId || '?'} surplusDay=${r.surplusDay ?? '?'})`);
   } catch (err) {
     console.warn(`⚠ CDN 刷新失败(可能读到旧 latest.json,${err.message})`);
+    degraded.push(`CDN 边缘缓存刷新失败(${err.message})`);
   }
   console.log(`✓ mirror done: ${BASE_URL}/${KEY_PREFIX}/latest.json`);
+
+  if (degraded.length) {
+    for (const d of degraded) console.log(`::warning::[qiniu-mirror] ${d}`);
+    console.error(`✗ mirror 降级完成:${degraded.length} 项(见上方 ⚠)`);
+    process.exit(2);
+  }
 } catch (err) {
   console.error(`✗ ${err.message}`);
   process.exit(1);
