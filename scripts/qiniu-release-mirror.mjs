@@ -5,7 +5,14 @@
 // 在 npm registry 不可达时回退到这里读 latest.json + 下载 tgz。
 //
 // 行为:
-//   1. npm pack <package_dir> 产出 <name>-<version>.tgz
+//   1. 主包 tgz 二选一:
+//      - 优先(带 --pack-spec name@version):从 npm registry 拉【已发布】的 tgz
+//        (hmh#58/0.1.17 发布实证:本地 npm pack 源码目录会打出残缺包——
+//        files 字段限定 dist/ 而 mirror job 只检出源码不构建,2.4kB 3 文件
+//        坏包直接上 CDN latest.json;registry 拉取才保证镜像===用户实际装到
+//        的包;发布岗位刚写完元数据,索引有秒级延迟,12×5s 重试)
+//      - 回退(--pack-spec 省略):npm pack <package_dir> 本地打包(仅当目录
+//        已构建时安全)
 //   2. 上传到 <bucket>:<key_prefix>/<tgz>
 //   3. 镜像原生依赖(FID-116):发布包 dependencies/optionalDependencies 里的包
 //      及一层内带 install 脚本的原生传递依赖,npm tarball 传到 <key_prefix>/native/,
@@ -23,7 +30,7 @@
 //
 // 用法:
 //   node scripts/qiniu-release-mirror.mjs \
-//     --dir packages/cli --version 0.1.15 \
+//     --dir packages/cli --pack-spec hunter-mate@0.1.17 --version 0.1.17 \
 //     --bucket hiredchina --key-prefix hunter-mate-releases \
 //     --keep 5 --base-url https://image.hiredchina.com
 //
@@ -46,6 +53,7 @@ function arg(name, dflt) {
   return i >= 0 ? process.argv[i + 1] : dflt;
 }
 const PKG_DIR = arg('dir', 'packages/cli');
+const PACK_SPEC = arg('pack-spec', ''); // name@version:从 registry 拉已发布 tgz(默认推荐)
 const VERSION = arg('version', '');
 const BUCKET = arg('bucket', 'hiredchina');
 const KEY_PREFIX = arg('key-prefix', 'hunter-mate-releases').replace(/\/+$/, '');
@@ -224,12 +232,33 @@ async function mirrorNativeDeps(pkgDir, tmp) {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qiniu-mirror-'));
 const degraded = []; // 降级项描述,末尾统一 ::warning:: + exit 2
 try {
-  // 1) npm pack(产出名:<name>-<version>.tgz)
-  const out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8' }).trim().split('\n').pop().trim();
+  // 1) 主包 tgz:优先 registry 拉已发布件(==用户实际装到的包);无 --pack-spec
+  //    时回退本地 npm pack(仅当该目录已构建才安全)
+  let out;
+  if (PACK_SPEC) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 12; attempt++) {
+      try {
+        out = execFileSync('npm', ['pack', PACK_SPEC, '--pack-destination', tmp],
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
+          .trim().split('\n').pop().trim();
+        break;
+      } catch (err) {
+        lastErr = err;
+        const stderr = String(err.stderr || '').trim().split('\n').pop();
+        console.log(`registry pack ${PACK_SPEC} 第 ${attempt}/12 次未就绪: ${stderr || err.message}`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+    if (!out) throw new Error(`npm pack ${PACK_SPEC} 失败(registry 索引延迟或发布未成功)`);
+  } else {
+    out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8' }).trim().split('\n').pop().trim();
+  }
   const tgzPath = path.join(tmp, out);
   if (!fs.existsSync(tgzPath)) throw new Error(`npm pack 产物不存在: ${tgzPath}`);
+  if (fs.statSync(tgzPath).size < 10 * 1024) throw new Error(`主包 tgz 异常小(${fs.statSync(tgzPath).size}B,疑似源码未构建的残缺包)——拒绝上 CDN`);
   const key = `${KEY_PREFIX}/${out}`;
-  console.log(`== pack: ${out} (${(fs.statSync(tgzPath).size / 1024 / 1024).toFixed(1)} MB)`);
+  console.log(`== pack: ${out} (${(fs.statSync(tgzPath).size / 1024 / 1024).toFixed(1)} MB${PACK_SPEC ? ` ← registry ${PACK_SPEC}` : ' ← local'})`);
 
   // 2) 上传 tgz
   await uploadFile(key, tgzPath);

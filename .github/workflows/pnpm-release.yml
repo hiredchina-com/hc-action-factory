@@ -361,8 +361,14 @@ jobs:
             echo "⚠ 工厂仓未配置 QINIU_ACCESS_KEY/QINIU_SECRET_KEY Secrets,跳过 CDN 镜像(CLI 回退通道不可用,但不影响发布)"
             exit 0
           fi
+          DIR=$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")
+          NAME=$(node -p "require('./${DIR}/package.json').name")
+          # hmh#58/0.1.17 实证:本地 pack 源码目录打出 2.4kB 残缺包(files 限定
+          # dist/ 而本 job 不构建);改从 registry 拉已发布 tgz(脚本内 12×5s
+          # 重试吞发布后的索引延迟),镜像===用户实际装到的包
           node qiniu-release-mirror.mjs \
-            --dir "$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")" \
+            --dir "$DIR" \
+            --pack-spec "${NAME}@${VERSION}" \
             --version "$VERSION" \
             --bucket "$(jq -r '.bucket // "hcweb-temp-file"' <<< "$MIRROR")" \
             --key-prefix "$(jq -r '.key_prefix // "releases"' <<< "$MIRROR")" \
