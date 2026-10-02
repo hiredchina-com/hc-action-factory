@@ -122,18 +122,21 @@ async function withRetry(label, fn, attempts = 5) {
 }
 
 async function uploadFile(key, filePath) {
-  const form = new FormData();
-  form.set('token', uploadToken(key));
-  form.set('key', key);
-  form.set('file', new Blob([fs.readFileSync(filePath)]));
-  // 逐主机尝试,每主机 2 次(总上限 ~6 分钟);token 区域无关,跨域收单后数据仍落本桶
+  // 传输层实验(0.1.18 实证):undici fetch 上传被 runner→qiniu 全域掐死(3 域×多轮
+  // 全 60s 超时,本地同代码秒过)——不能排除 WAF 按 TLS/HTTP 指纹封云 ASN。curl 是
+  // 完全不同的 TCP/TLS 栈:curl 通=指纹封锁实锤且已绕过;curl 也挂=IP 级封禁坐实。
+  // token 仅存活 1h 且 runner 为临空单租户 VM,argv 短暂可见可接受。
   let last = null;
   for (const host of UPLOAD_HOSTS) {
     try {
       return await withRetry(`upload ${key}@${host}`, async () => {
-        const res = await fetch(`https://${host}`, { method: 'POST', body: form, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-        if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
-        return res.json();
+        const out = execFileSync('curl', [
+          '-fsS', '--max-time', '70', '-X', 'POST', `https://${host}`,
+          '-F', `token=${uploadToken(key)}`,
+          '-F', `key=${key}`,
+          '-F', `file=@${filePath}`,
+        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 }).trim();
+        return JSON.parse(out);
       }, 2);
     } catch (err) { last = err; }
   }
