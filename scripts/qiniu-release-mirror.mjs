@@ -65,8 +65,14 @@ const BUCKET = arg('bucket', 'hiredchina');
 const KEY_PREFIX = arg('key-prefix', 'hunter-mate-releases').replace(/\/+$/, '');
 const KEEP = Math.max(1, parseInt(arg('keep', '5'), 10) || 5);
 const BASE_URL = arg('base-url', 'https://image.hiredchina.com').replace(/\/+$/, '');
-// 上传主机必须与 bucket 所在区域一致:hiredchina/hcweb-temp-file 都在 z2(华南),默认 up-z2
-const UPLOAD_HOST = arg('upload-host', 'up-z2.qiniup.com');
+// 上传主机必须与 bucket 所在区域一致:hiredchina/hcweb-temp-file 都在 z2(华南),默认 up-z2。
+// 但 0.1.18 实证 runner→up-z2 路径会被整段掐死(5×60s 全超时,而 2 小时前 0.1.17 同
+// 路径正常 = 出口/WAF 按目标域封禁的间歇性行为,非配置错)。upload token 区域无关,
+// 任一 up 主机都可收单——故默认走主机 fallback 链,单域被封自动换域;--upload-host
+// 显式指定时退回单主机(调试/锁定用途)。
+const UPLOAD_HOSTS = arg('upload-host', '')
+  ? [arg('upload-host', '')]
+  : ['up-z2.qiniup.com', 'up-z0.qiniup.com', 'up.qiniup.com'];
 
 const AK = process.env.QINIU_ACCESS_KEY || '';
 const SK = process.env.QINIU_SECRET_KEY || '';
@@ -120,11 +126,18 @@ async function uploadFile(key, filePath) {
   form.set('token', uploadToken(key));
   form.set('key', key);
   form.set('file', new Blob([fs.readFileSync(filePath)]));
-  return withRetry(`upload ${key}`, async () => {
-    const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
-    return res.json();
-  });
+  // 逐主机尝试,每主机 2 次(总上限 ~6 分钟);token 区域无关,跨域收单后数据仍落本桶
+  let last = null;
+  for (const host of UPLOAD_HOSTS) {
+    try {
+      return await withRetry(`upload ${key}@${host}`, async () => {
+        const res = await fetch(`https://${host}`, { method: 'POST', body: form, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
+        return res.json();
+      }, 2);
+    } catch (err) { last = err; }
+  }
+  throw last;
 }
 
 async function listTgz() {
