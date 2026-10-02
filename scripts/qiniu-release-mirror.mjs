@@ -94,6 +94,11 @@ function uploadToken(key) {
   return `${AK}:${b64u(hmac(encoded))}:${encoded}`;
 }
 
+/** fetch 全局超时:连接挂起无 reject,withRetry 救不了——0.1.18 镜像 job 实证
+ * npm pack 步骤无超时挂死 20+ 分钟(job 级默认 360min 才杀)。所有 fetch 与
+ * npm 子进程都必须带超时,把"挂死"变成"可重试的错误"。 */
+const FETCH_TIMEOUT = 60_000;
+
 /** 网络抖动重试(fetch failed 是 undici 瞬时错误,0.1.17 补发实证 runner 出网
  * 对部分目标不稳定;重试必须尽量吃掉抖动——残留失败=真问题,直接硬失败) */
 async function withRetry(label, fn, attempts = 5) {
@@ -116,7 +121,7 @@ async function uploadFile(key, filePath) {
   form.set('key', key);
   form.set('file', new Blob([fs.readFileSync(filePath)]));
   return withRetry(`upload ${key}`, async () => {
-    const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form });
+    const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
     return res.json();
   });
@@ -126,6 +131,7 @@ async function listTgz() {
   const pathAndQuery = `/list?bucket=${encodeURIComponent(BUCKET)}&prefix=${encodeURIComponent(`${KEY_PREFIX}/`)}&limit=1000`;
   const res = await fetch(`https://rsf.qiniu.com${pathAndQuery}`, {
     headers: { Authorization: qboxSign('GET', pathAndQuery, 'rsf.qiniu.com') },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
   if (!res.ok) throw new Error(`list 失败: HTTP ${res.status} ${await res.text()}`);
   const data = await res.json();
@@ -147,6 +153,7 @@ async function deleteKey(key) {
   const res = await fetch(`https://rs.qiniu.com${pathAndQuery}`, {
     method: 'POST',
     headers: { Authorization: qboxSign('POST', pathAndQuery, 'rs.qiniu.com') },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
   if (!res.ok) throw new Error(`delete ${key} 失败: HTTP ${res.status} ${await res.text()}`);
 }
@@ -160,7 +167,7 @@ async function cdnRefresh(urls) {
   const pathAndQuery = '/v2/tune/refresh';
   const FUSION_HOST = 'fusion.qiniuapi.com';
   const headers = { 'Content-Type': 'application/json', Authorization: qboxSign('POST', pathAndQuery, FUSION_HOST, { 'content-type': 'application/json' }, body) };
-  const res = await fetch(`https://${FUSION_HOST}${pathAndQuery}`, { method: 'POST', headers, body });
+  const res = await fetch(`https://${FUSION_HOST}${pathAndQuery}`, { method: 'POST', headers, body, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   const text = await res.text();
   if (!res.ok) throw new Error(`CDN refresh 失败: HTTP ${res.status} ${text}`);
   // fusion 业务错误也返回 HTTP 200 + body.code != 200,必须查体
@@ -180,7 +187,7 @@ async function npmView(name, range, fields) {
   const spec = range ? `${name}@${range}` : name;
   let out;
   try {
-    out = execFileSync('npm', ['view', spec, '--json', '--fetch-retries=2', ...fields], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    out = execFileSync('npm', ['view', spec, '--json', '--fetch-retries=2', ...fields], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 }).trim();
   } catch (err) {
     const stderr = String(err.stderr || '').trim().split('\n').pop();
     throw new Error(`npm view ${spec} 失败: ${stderr || err.message}`);
@@ -196,7 +203,7 @@ async function npmView(name, range, fields) {
 
 async function downloadTo(url, dest) {
   await withRetry(`download ${url}`, async () => {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
   });
@@ -269,7 +276,7 @@ try {
     for (let attempt = 1; attempt <= 12; attempt++) {
       try {
         out = execFileSync('npm', ['pack', PACK_SPEC, '--pack-destination', tmp],
-          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
+          { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 })
           .trim().split('\n').pop().trim();
         break;
       } catch (err) {
@@ -281,7 +288,7 @@ try {
     }
     if (!out) throw new Error(`npm pack ${PACK_SPEC} 失败(registry 索引延迟或发布未成功)`);
   } else {
-    out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8' }).trim().split('\n').pop().trim();
+    out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8', timeout: 180_000 }).trim().split('\n').pop().trim();
   }
   const tgzPath = path.join(tmp, out);
   if (!fs.existsSync(tgzPath)) throw new Error(`npm pack 产物不存在: ${tgzPath}`);
