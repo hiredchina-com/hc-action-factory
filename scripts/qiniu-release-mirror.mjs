@@ -152,11 +152,15 @@ async function deleteKey(key) {
 }
 
 async function cdnRefresh(urls) {
-  // 官方路径是 /v2/tune/refresh(旧写 /refresh 会连接级失败,0.1.16 发布实证 fetch failed)
+  // 官方路径 /v2/tune/refresh;主机必须用现行域 fusion.qiniuapi.com——
+  // 旧域 fusion.qiniu.com 已 NXDOMAIN(2026-10 本机+GitHub runner 双端实证:
+  // 0.1.17 run 仍 fetch failed;rs.qiniu.com/up-z2 正常,仅 fusion 旧域被回收),
+  // rs.qiniu.com 系未动。签名 Host 头与 fetch 主机必须同域(签名原文与实发头同构造)。
   const body = JSON.stringify({ urls });
   const pathAndQuery = '/v2/tune/refresh';
-  const headers = { 'Content-Type': 'application/json', Authorization: qboxSign('POST', pathAndQuery, 'fusion.qiniu.com', { 'content-type': 'application/json' }, body) };
-  const res = await fetch(`https://fusion.qiniu.com${pathAndQuery}`, { method: 'POST', headers, body });
+  const FUSION_HOST = 'fusion.qiniuapi.com';
+  const headers = { 'Content-Type': 'application/json', Authorization: qboxSign('POST', pathAndQuery, FUSION_HOST, { 'content-type': 'application/json' }, body) };
+  const res = await fetch(`https://${FUSION_HOST}${pathAndQuery}`, { method: 'POST', headers, body });
   const text = await res.text();
   if (!res.ok) throw new Error(`CDN refresh 失败: HTTP ${res.status} ${text}`);
   // fusion 业务错误也返回 HTTP 200 + body.code != 200,必须查体
