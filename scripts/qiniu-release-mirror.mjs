@@ -18,15 +18,19 @@
 //      及一层内带 install 脚本的原生传递依赖,npm tarball 传到 <key_prefix>/native/,
 //      登记进 latest.json.nativeDeps,供国内安装路径零 registry 下载
 //      (版本区间经 `npm view` 解析——registry URL 路径只收精确版本/tag,直接拼
-//      range 会 404,0.1.16 发布实证 better-sqlite3@^13.0.3 全跳过)
+//      range 会 404,0.1.16 发布实证 better-sqlite3@^13.0.3 全跳过)。
+//      网络操作全部 5 次退避重试(0.1.17 补发实证 runner 出网抖动裸 fetch failed);
+//      必需依赖(dependencies)失败=硬失败 exit 1,可选依赖失败才降级 exit 2。
 //   4. 写并上传 <key_prefix>/latest.json = {version, tgz, publishedAt, nativeDeps?}
 //   5. 列出现有主包 *.tgz(native/ 子目录不参与),semver 降序,删除超出 --keep 的旧版本
 //      (该 AK/SK 无 rsf/rs 管理权限,已知 401 降级,FID-102;清理靠 keep 上限容忍)
 //   6. CDN 刷新 latest.json 与 tgz URL(fusion /v2/tune/refresh;失败 exit 2 打
 //      ::warning:: 注解可见,不阻断 release——job 级 continue-on-error)
 //
-// 退出码:0 全绿;2 有降级(native 缺失/刷新失败/管理接口不可用),job 显红不阻断;
-//        1 硬失败(主包上传失败等)。
+// 退出码:0 全绿;2 有降级(可选 native 缺失/清理 401/刷新失败),job 显红不阻断;
+//        1 硬失败(主包上传失败 / 【必需】native 依赖镜像失败——hmh#58 补发
+//          实证:better-sqlite3 是 dependencies 硬依赖,镜像缺失会让 CDN 离线
+//          通道对该依赖完全不可用,不允许降级放行)。
 //
 // 用法:
 //   node scripts/qiniu-release-mirror.mjs \
@@ -88,14 +92,32 @@ function uploadToken(key) {
   return `${AK}:${b64u(hmac(encoded))}:${encoded}`;
 }
 
+/** 网络抖动重试(fetch failed 是 undici 瞬时错误,0.1.17 补发实证 runner 出网
+ * 对部分目标不稳定;必需 native 依赖的失败必须靠重试吃掉,而不是降级放行) */
+async function withRetry(label, fn, attempts = 5) {
+  let last = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      last = err;
+      console.log(`⚠ ${label} 第 ${i}/${attempts} 次失败: ${err.message}`);
+      if (i < attempts) await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+  throw last;
+}
+
 async function uploadFile(key, filePath) {
   const form = new FormData();
   form.set('token', uploadToken(key));
   form.set('key', key);
   form.set('file', new Blob([fs.readFileSync(filePath)]));
-  const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form });
-  if (!res.ok) throw new Error(`upload ${key} 失败: HTTP ${res.status} ${await res.text()}`);
-  return res.json();
+  return withRetry(`upload ${key}`, async () => {
+    const res = await fetch(`https://${UPLOAD_HOST}`, { method: 'POST', body: form });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    return res.json();
+  });
 }
 
 async function listTgz() {
@@ -167,9 +189,11 @@ async function npmView(name, range, fields) {
 }
 
 async function downloadTo(url, dest) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download ${url}: HTTP ${res.status}`);
-  fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  await withRetry(`download ${url}`, async () => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  });
 }
 
 async function mirrorNativeDeps(pkgDir, tmp) {
@@ -218,8 +242,14 @@ async function mirrorNativeDeps(pkgDir, tmp) {
         }
       }
     } catch (err) {
-      console.warn(`⚠ native ${name}@${range} 镜像跳过: ${err.message}`);
-      skipped.push({ name, range, optional: !!optional });
+      // 可选依赖(keytar 等)失败降级;必需依赖(better-sqlite3=SQLite 存储底座)
+      // 失败硬抛——CDN 离线通道缺硬依赖=通道对该依赖不可用,不允许放行
+      if (optional) {
+        console.warn(`⚠ native ${name}@${range} 镜像跳过: ${err.message}`);
+        skipped.push({ name, range, optional: !!optional });
+      } else {
+        throw new Error(`必需 native 依赖 ${name}@${range} 镜像失败(重试后仍不可达): ${err.message}`);
+      }
     }
   }
 
