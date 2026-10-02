@@ -20,17 +20,19 @@
 //      (版本区间经 `npm view` 解析——registry URL 路径只收精确版本/tag,直接拼
 //      range 会 404,0.1.16 发布实证 better-sqlite3@^13.0.3 全跳过)。
 //      网络操作全部 5 次退避重试(0.1.17 补发实证 runner 出网抖动裸 fetch failed);
-//      必需依赖(dependencies)失败=硬失败 exit 1,可选依赖失败才降级 exit 2。
+//      【所有】登记 nativeDeps(含可选 keytar)镜像失败=硬失败 exit 1——用户裁定:
+//      可选性由运行时降级承担(如 keychain.ts 0o600 文件兜底),镜像层的承诺是
+//      "CDN 通道零 registry 安装",差异化降级=通道自打脸,重试后仍失败值得阻断。
 //   4. 写并上传 <key_prefix>/latest.json = {version, tgz, publishedAt, nativeDeps?}
 //   5. 列出现有主包 *.tgz(native/ 子目录不参与),semver 降序,删除超出 --keep 的旧版本
 //      (该 AK/SK 无 rsf/rs 管理权限,已知 401 降级,FID-102;清理靠 keep 上限容忍)
 //   6. CDN 刷新 latest.json 与 tgz URL(fusion /v2/tune/refresh;失败 exit 2 打
 //      ::warning:: 注解可见,不阻断 release——job 级 continue-on-error)
 //
-// 退出码:0 全绿;2 有降级(可选 native 缺失/清理 401/刷新失败),job 显红不阻断;
-//        1 硬失败(主包上传失败 / 【必需】native 依赖镜像失败——hmh#58 补发
-//          实证:better-sqlite3 是 dependencies 硬依赖,镜像缺失会让 CDN 离线
-//          通道对该依赖完全不可用,不允许降级放行)。
+// 退出码:0 全绿;2 有降级(清理 401/刷新失败等通道增强项),job 显红不阻断;
+//        1 硬失败(主包上传失败 / 任一 nativeDeps 镜像失败——hmh#58 补发实证:
+//          better-sqlite3 缺份让所有用户 server 起不来;keytar 缺份让 CDN 通道
+//          承诺的"零 registry 安装"破裂,同样是硬失败)。
 //
 // 用法:
 //   node scripts/qiniu-release-mirror.mjs \
@@ -93,7 +95,7 @@ function uploadToken(key) {
 }
 
 /** 网络抖动重试(fetch failed 是 undici 瞬时错误,0.1.17 补发实证 runner 出网
- * 对部分目标不稳定;必需 native 依赖的失败必须靠重试吃掉,而不是降级放行) */
+ * 对部分目标不稳定;重试必须尽量吃掉抖动——残留失败=真问题,直接硬失败) */
 async function withRetry(label, fn, attempts = 5) {
   let last = null;
   for (let i = 1; i <= attempts; i++) {
@@ -200,7 +202,6 @@ async function mirrorNativeDeps(pkgDir, tmp) {
   const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
   const nativeDeps = {};
   const urls = [];
-  const skipped = []; // 声明了但镜像失败的 [{name, range, optional}]——main 里据此处打告警
 
   async function mirrorOne(name, range, optional) {
     try {
@@ -237,25 +238,19 @@ async function mirrorNativeDeps(pkgDir, tmp) {
           urls.push(`${BASE_URL}/${ckey}`);
           console.log(`✓ native mirrored(传递) ${cn}@${cver} -> ${ckey}`);
         } catch (err) {
-          console.warn(`⚠ native 传递依赖 ${cn}@${cr} 镜像跳过: ${err.message}`);
-          skipped.push({ name: cn, range: cr, optional: false });
+          throw new Error(`native 传递依赖 ${cn}@${cr} 镜像失败(重试后仍不可达): ${err.message}`);
         }
       }
     } catch (err) {
-      // 可选依赖(keytar 等)失败降级;必需依赖(better-sqlite3=SQLite 存储底座)
-      // 失败硬抛——CDN 离线通道缺硬依赖=通道对该依赖不可用,不允许放行
-      if (optional) {
-        console.warn(`⚠ native ${name}@${range} 镜像跳过: ${err.message}`);
-        skipped.push({ name, range, optional: !!optional });
-      } else {
-        throw new Error(`必需 native 依赖 ${name}@${range} 镜像失败(重试后仍不可达): ${err.message}`);
-      }
+      // 无软硬之分:凡登记进 latest.json.nativeDeps 的条目缺份,CDN 通道承诺
+      // 即破裂(可选依赖的运行时降级不豁免镜像完整性),一律硬失败
+      throw new Error(`native ${name}@${range} 镜像失败(重试后仍不可达): ${err.message}`);
     }
   }
 
   for (const [name, range] of Object.entries(pkg.dependencies || {})) await mirrorOne(name, range, false);
   for (const [name, range] of Object.entries(pkg.optionalDependencies || {})) await mirrorOne(name, range, true);
-  return { nativeDeps, urls, skipped };
+  return { nativeDeps, urls };
 }
 
 // ---------- main ----------
@@ -295,8 +290,7 @@ try {
   console.log(`✓ uploaded ${BUCKET}:${key}`);
 
   // 2.5) 原生依赖镜像(FID-116;任一失败降级告警,主包镜像不受影响)
-  const { nativeDeps, urls: nativeUrls, skipped } = await mirrorNativeDeps(PKG_DIR, tmp);
-  for (const s of skipped) degraded.push(`native ${s.name}@${s.range} 未镜像(离线安装该依赖将回退 registry)`);
+  const { nativeDeps, urls: nativeUrls } = await mirrorNativeDeps(PKG_DIR, tmp);
 
   // 3) latest.json(tgz 上传成功后才写,避免指向不存在的包)
   const manifest = { version: VERSION, tgz: out, publishedAt: new Date().toISOString() };
