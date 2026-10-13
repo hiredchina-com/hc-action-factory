@@ -287,7 +287,10 @@ jobs:
           git commit --no-verify -m "chore(deps): sync ${SCOPE}/${PKG} to ${TGT}
 
           Auto-synced by hc-action-factory pipeline/sync-deps"
-          git push origin "$BRANCH"
+          # chore/<pkg>-sync-* 分支是机器人独占命名空间;历史 run 可能留下同名分支
+          # (如 PR 被人工关闭未删分支,18:17 non-fast-forward 实证)→ lease 优先,兜底强推
+          git fetch origin "$BRANCH" || true
+          git push --force-with-lease origin "$BRANCH" || git push --force origin "$BRANCH"
           gh pr create --repo "$REPO" \
             --base "$BASE" \
             --head "$BRANCH" \
