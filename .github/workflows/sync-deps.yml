@@ -125,12 +125,13 @@ jobs:
           PKG: ${{ steps.cfg.outputs.package }}
           SCOPE: ${{ steps.cfg.outputs.dep_scope }}
         run: |
-          P="$PKG"; [[ "$P" == "all" ]] && P="kit"
           # monorepo 消费方(hunter-mate)依赖在 packages/*/package.json,不在根——
           # 全扫描含该依赖的文件清单 + 首个命中版本;全 absent 视为无需同步(不替消费方新增依赖)
+          # 注意:node 只看得见 env(PKG/SCOPE),看不见 bash 局部变量 P——all→kit 映射须在 JS 内做
           node -e "
             const fs = require('fs');
-            const key = process.env.SCOPE + '/' + process.env.P;
+            let P = process.env.PKG; if (P === 'all') P = 'kit';
+            const key = process.env.SCOPE + '/' + P;
             const files = ['package.json', ...fs.readdirSync('packages').filter(d => fs.existsSync('packages/' + d + '/package.json')).map(d => 'packages/' + d + '/package.json')];
             const hits = []; let cur = 'ABSENT';
             for (const f of files) {
@@ -288,7 +289,9 @@ jobs:
 
       - name: Report status
         if: always()
-        uses: ./.github/actions/report-status
+        # 远程引用工厂仓 action:本 job 的 checkout 是【目标仓】,./ 本地路径找不到工厂 action
+        # (2026-10-13 实证:skip 路径也走到这步并报 Can't find action.yml)
+        uses: hiredchina-com/hc-action-factory/.github/actions/report-status@main
         with:
           token: ${{ secrets.FACTORY_PAT }}
           repository: ${{ inputs.repository }}
