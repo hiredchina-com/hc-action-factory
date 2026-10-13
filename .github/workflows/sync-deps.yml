@@ -255,7 +255,9 @@ jobs:
           pnpm install --no-frozen-lockfile
           pnpm typecheck
           TEST_CMD=$(jq -r '.test_cmd // ""' <<< "$PARAMS")
-          [[ -n "$TEST_CMD" ]] && eval "$TEST_CMD"
+          # 注意:TEST_CMD 为空时 [[ -n ]] && eval 的退出码是 1,在 set -e 下会杀掉整个 step
+          # (17:04 kit 跑实证:install+typecheck 全绿仍 exit 1)——必须用 if 包裹
+          if [[ -n "$TEST_CMD" ]]; then eval "$TEST_CMD"; fi
 
       - name: Commit + push branch + PR
         if: ${{ steps.need.outputs.match != 'true' }}
