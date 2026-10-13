@@ -3,6 +3,8 @@ name: pipeline/sync-deps
 # 依赖同步 + 自动开 PR(替代 hunter-mate sync-chromepilot-deps.yml)
 # 触发链:chromepilot pnpm-release(packages 发布成功)→ post_dispatch → router(event_type=sync-deps)→ 本 pipeline
 # 也可在工厂仓手动 workflow_dispatch(应急,替代原仓库的手动入口)。
+# monorepo 语义:bump 扫描根 + packages/*/package.json 全量含该依赖的文件并同升;
+#   消费方完全无该依赖时安全跳过(不替消费方新增依赖)。
 #
 # params_json schema:
 # {
@@ -117,14 +119,30 @@ jobs:
           cache: pnpm
           registry-url: "https://registry.npmjs.org"
 
-      - name: 读取当前依赖版本
+      - name: 读取当前依赖版本(根 + packages/* 全扫描)
         id: current
         env:
           PKG: ${{ steps.cfg.outputs.package }}
           SCOPE: ${{ steps.cfg.outputs.dep_scope }}
         run: |
           P="$PKG"; [[ "$P" == "all" ]] && P="kit"
-          echo "current=$(node -p "require('./package.json').dependencies['${SCOPE}/${P}']")" >> "$GITHUB_OUTPUT"
+          # monorepo 消费方(hunter-mate)依赖在 packages/*/package.json,不在根——
+          # 全扫描含该依赖的文件清单 + 首个命中版本;全 absent 视为无需同步(不替消费方新增依赖)
+          node -e "
+            const fs = require('fs');
+            const key = process.env.SCOPE + '/' + process.env.P;
+            const files = ['package.json', ...fs.readdirSync('packages').filter(d => fs.existsSync('packages/' + d + '/package.json')).map(d => 'packages/' + d + '/package.json')];
+            const hits = []; let cur = 'ABSENT';
+            for (const f of files) {
+              try {
+                const p = JSON.parse(fs.readFileSync(f));
+                const v = p.dependencies && p.dependencies[key];
+                if (v) { hits.push(f); if (cur === 'ABSENT') cur = v; }
+              } catch (e) {}
+            }
+            console.log('files=' + hits.join(' '));
+            console.log('current=' + cur);
+          " >> "$GITHUB_OUTPUT"
 
       - name: 解析目标版本(npm latest)
         id: target
@@ -142,6 +160,11 @@ jobs:
           CUR: ${{ steps.current.outputs.current }}
           TGT: ${{ steps.target.outputs.target }}
         run: |
+          if [[ "$CUR" == "ABSENT" ]]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "目标仓无该依赖,跳过(新增依赖由消费方 req 决定,不在同步范围)"
+            exit 0
+          fi
           CUR_VER=$(printf '%s' "$CUR" | sed -E 's/^[\^~>=]+\s*//')
           if [[ "$CUR_VER" == "$TGT" ]]; then
             echo "match=true" >> "$GITHUB_OUTPUT"
@@ -151,19 +174,25 @@ jobs:
             echo "当前 $CUR_VER → 目标 $TGT,需要更新"
           fi
 
-      - name: Bump 依赖版本
+      - name: Bump 依赖版本(所有命中文件同升)
         if: ${{ steps.need.outputs.match != 'true' }}
         env:
           SCOPE: ${{ steps.cfg.outputs.dep_scope }}
           PKG: ${{ steps.target.outputs.package }}
           TGT: ${{ steps.target.outputs.target }}
+          FILES: ${{ steps.current.outputs.files }}
         run: |
           node -e "
             const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json'));
-            pkg.dependencies[process.env.SCOPE + '/' + process.env.PKG] = process.env.TGT;
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-            console.log('updated to', process.env.TGT);
+            const key = process.env.SCOPE + '/' + process.env.PKG;
+            for (const f of process.env.FILES.split(' ').filter(Boolean)) {
+              const pkg = JSON.parse(fs.readFileSync(f));
+              if (pkg.dependencies && pkg.dependencies[key]) {
+                pkg.dependencies[key] = process.env.TGT;
+                fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + '\n');
+                console.log('updated', f, 'to', process.env.TGT);
+              }
+            }
           "
 
       - name: 移除 pnpm.overrides 兜底
