@@ -116,7 +116,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.cfg.outputs.node }}
-          cache: pnpm
+          # 不开 pnpm cache:post 阶段 cache 路径校验在 skip 路径上会以 ##[error] 标记整 job 失败
+          # (2026-10-13 实证 logger-kit/recording-ui 两跑),本 job 仅分钟级,缓存收益可忽略
           registry-url: "https://registry.npmjs.org"
 
       - name: 读取当前依赖版本(根 + packages/* 全扫描)
@@ -250,7 +251,8 @@ jobs:
           PARAMS: ${{ steps.cfg.outputs.params }}
         run: |
           set -euo pipefail
-          pnpm install
+          # bump 后 lockfile 必然过期,必须允许更新(CI 默认 frozen-lockfile 会 ERR_PNPM_OUTDATED_LOCKFILE)
+          pnpm install --no-frozen-lockfile
           pnpm typecheck
           TEST_CMD=$(jq -r '.test_cmd // ""' <<< "$PARAMS")
           [[ -n "$TEST_CMD" ]] && eval "$TEST_CMD"
