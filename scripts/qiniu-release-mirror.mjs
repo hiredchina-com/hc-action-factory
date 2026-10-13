@@ -208,7 +208,13 @@ async function npmView(name, range, fields) {
     const stderr = String(err.stderr || '').trim().split('\n').pop();
     throw new Error(`npm view ${spec} 失败: ${stderr || err.message}`);
   }
-  if (!out) throw new Error(`npm view ${spec}: 空输出`);
+  if (!out) {
+    // 无该字段的包 npm 零输出(2026-10-13 @hunter-mate/telemetry 1.3.0 发布实证:
+    // 取 uuid 的 dependencies → 空输出炸整条 native 镜像,optional 原生依赖全跳过)。
+    // 字段缺失≠不可达:dependencies 查询空输出按 {} 处理;其余字段仍视为失败。
+    if (fields.length === 1 && fields[0] === 'dependencies') return { dependencies: {} };
+    throw new Error(`npm view ${spec}: 空输出`);
+  }
   let d = JSON.parse(out);
   // range 匹配多版本时 npm 输出升序数组(npm view node-addon-api@^8 实证 15 项),
   // 取最后一项 = 最大满足版本(与 npm install 解析一致);单匹配输出裸对象/标量
