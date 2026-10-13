@@ -274,7 +274,14 @@ jobs:
           git config user.name "harness-bot"
           BRANCH="chore/${PKG}-sync-${TGT}"
           git checkout -b "$BRANCH"
-          git add -A
+          # 只加 dep-sync 语义内的文件:-A 会把 pnpm install 重写的跟踪中的
+          # node_modules/.bin shim 扫进 PR(hunter-mate 实证,PR#38 被污染关闭)
+          git add package.json pnpm-lock.yaml
+          git add packages/*/package.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "无暂存变更,跳过提交(异常情况,需要人工排查)"
+            exit 1
+          fi
           # --no-verify:目标仓(hunter-mate)husky pre-commit 在 CI 环境必挂(code 2,17:26 实证),
           # 机器人 dep-sync 提交不需要也不应跑消费方 hooks
           git commit --no-verify -m "chore(deps): sync ${SCOPE}/${PKG} to ${TGT}
