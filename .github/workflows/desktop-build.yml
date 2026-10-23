@@ -1,0 +1,227 @@
+name: desktop-build
+
+# HunterMate 桌面版构建发布 pipeline(huntermate-desktop 私有仓 dispatcher 触发)。
+#
+# 触发:router 的 desktop-build 事件;params:
+#   version     语义化版本(必填,如 0.1.0;dispatcher 从 tag v* 剥前缀)
+#   notes       发行说明(可选)
+#   mac         "true" 构建 macOS(默认 true;macos-14 10x 计费,按需关)
+#   win         "true" 构建 Windows(默认 true)
+#
+# 产物:七牛 hiredchina-npm-mirror packages/huntermate-desktop-releases/
+#   v<version>/HunterMate-<version>-arm64.dmg
+#   v<version>/HunterMate Setup <version>.exe
+#   latest.json(下载页 /downloads 消费,带 cache-buster)
+#
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
+# FID-121 教训在上传脚本内消化(curl + up 主机 fallback),job 不感知。
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      params_json:
+        required: true
+        type: string
+
+jobs:
+  detect:
+    name: resolve params
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      notes: ${{ steps.v.outputs.notes }}
+      want_mac: ${{ steps.v.outputs.want_mac }}
+      want_win: ${{ steps.v.outputs.want_win }}
+    steps:
+      - id: v
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version // ""' <<< "$PARAMS")
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "✗ params.version 非法: '$VERSION'"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "notes=$(jq -r '.notes // ""' <<< "$PARAMS" | tr '\n' ' ' | cut -c1-500)" >> "$GITHUB_OUTPUT"
+          echo "want_mac=$(jq -r '.mac // "true"' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+          echo "want_win=$(jq -r '.win // "true"' <<< "$PARAMS")" >> "$GITHUB_OUTPUT"
+          echo "✓ desktop-build params: version=$VERSION"
+
+  build-mac:
+    name: mac dmg (arm64)
+    needs: detect
+    if: ${{ needs.detect.outputs.want_mac == 'true' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # electron 二进制走 npmmirror(CN 可达,仓库 .npmrc 亦已配置)
+      - name: Prepare deps + assets + gate
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run prepare:runtime
+          npm run prepare:hm-server
+          npm run build:gate
+      - name: Unit tests (发版门禁)
+        run: npm test
+      - name: Build dmg
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: npx electron-builder --mac dmg --arm64 --publish never
+      - name: Locate + hash artifact
+        id: art
+        run: |
+          set -euo pipefail
+          DMG=$(ls dist/*.dmg | head -1)
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "sha=$(shasum -a 256 "$DMG" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: ${{ steps.art.outputs.dmg }}
+          if-no-files-found: error
+
+  build-win:
+    name: win nsis (x64)
+    needs: detect
+    if: ${{ needs.detect.outputs.want_win == 'true' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Prepare deps + assets + gate
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run prepare:runtime
+          npm run prepare:hm-server
+          npm run build:gate
+      - name: Unit tests (发版门禁)
+        shell: bash
+        run: npm test
+      - name: Build nsis
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        shell: bash
+        run: npx electron-builder --win nsis --x64 --publish never
+      - name: Locate + hash artifact
+        id: art
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=$(ls dist/*.exe | head -1)
+          echo "exe=$EXE" >> "$GITHUB_OUTPUT"
+          echo "sha=$(sha256sum "$EXE" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-exe
+          path: ${{ steps.art.outputs.exe }}
+          if-no-files-found: error
+
+  publish:
+    name: publish → qiniu CDN
+    needs: [detect, build-mac, build-win]
+    if: ${{ always() && needs.detect.result == 'success' && (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') && (needs.build-win.result == 'success' || needs.build-win.result == 'skipped') && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiredchina-com/hc-action-factory
+          ref: main
+          fetch-depth: "1"
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-dmg
+          path: artifacts/mac
+        if: ${{ needs.build-mac.result == 'success' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: win-exe
+          path: artifacts/win
+        if: ${{ needs.build-win.result == 'success' }}
+      - name: Publish
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          NOTES: ${{ needs.detect.outputs.notes }}
+        run: |
+          set -uo pipefail
+          if [ -z "${QINIU_ACCESS_KEY:-}" ] || [ -z "${QINIU_SECRET_KEY:-}" ]; then
+            echo "✗ 工厂仓未配置 QINIU keys,拒绝发布(产物已存 artifact 可补发)"; exit 1
+          fi
+          MAC_FILE=""; MAC_SHA=""
+          if [ -d artifacts/mac ]; then
+            MAC_FILE=$(ls artifacts/mac/*.dmg | head -1)
+            MAC_SHA=$(sha256sum "$MAC_FILE" | awk '{print $1}')
+          fi
+          WIN_FILE=""; WIN_SHA=""
+          if [ -d artifacts/win ]; then
+            WIN_FILE=$(ls "artifacts/win"/*.exe | head -1)
+            WIN_SHA=$(sha256sum "$WIN_FILE" | awk '{print $1}')
+          fi
+          ARGS=(--version "$VERSION" --bucket hiredchina-npm-mirror \
+            --key-prefix packages/huntermate-desktop-releases --keep 5 \
+            --base-url https://npm.hiredchina.com --notes "$NOTES")
+          [ -n "$MAC_FILE" ] && ARGS+=(--mac-file "$MAC_FILE" --mac-sha256 "$MAC_SHA")
+          [ -n "$WIN_FILE" ] && ARGS+=(--win-file "$WIN_FILE" --win-sha256 "$WIN_SHA")
+          node scripts/qiniu-desktop-release.mjs "${ARGS[@]}"
+
+  finalize:
+    name: finalize (status)
+    needs: [detect, build-mac, build-win, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve final state
+        id: state
+        env:
+          DETECT: ${{ needs.detect.result }}
+          MAC: ${{ needs.build-mac.result }}
+          WIN: ${{ needs.build-win.result }}
+          PUBLISH: ${{ needs.publish.result }}
+        run: |
+          ok_or_skip() { [[ "$1" == "success" || "$1" == "skipped" ]]; }
+          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" ]]; then
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" ]]; then
+            echo "state=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=error" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Report
+        env:
+          STATE: ${{ steps.state.outputs.state }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          if [ "$STATE" = "success" ]; then
+            echo "::notice title=desktop-build::HunterMate Desktop v${VERSION} 已发布 → https://npm.hiredchina.com/packages/huntermate-desktop-releases/latest.json"
+          else
+            echo "::error title=desktop-build::state=${STATE} version=${VERSION}"
+            exit 1
+          fi

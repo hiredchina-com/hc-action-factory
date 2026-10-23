@@ -20,6 +20,7 @@ on:
       - os-eval
       - shell-lint
       - sync-deps
+      - desktop-build
 
 jobs:
   guard:
@@ -191,4 +192,14 @@ jobs:
       event_name: ${{ needs.guard.outputs.event_name }}
       commit_msg: ${{ needs.guard.outputs.commit_msg }}
       commit_author: ${{ needs.guard.outputs.commit_author }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  desktop-build:
+    needs: guard
+    if: github.event.action == 'desktop-build'
+    uses: ./.github/workflows/desktop-build.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
       params_json: ${{ needs.guard.outputs.params_json }}
