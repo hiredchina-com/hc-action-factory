@@ -79,6 +79,8 @@ jobs:
           npm run build:gate
       - name: Unit tests (发版门禁)
         run: npm test
+      - name: E2E tests (真实应用冷启动全链路;仅 mac——win runner GUI 会话不确定)
+        run: npm run test:e2e
       - name: Build dmg
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
