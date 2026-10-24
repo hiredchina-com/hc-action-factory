@@ -21,6 +21,7 @@ on:
       - shell-lint
       - sync-deps
       - desktop-build
+      - hmh-release
 
 jobs:
   guard:
@@ -198,6 +199,16 @@ jobs:
     needs: guard
     if: github.event.action == 'desktop-build'
     uses: ./.github/workflows/desktop-build.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  hmh-release:
+    needs: guard
+    if: github.event.action == 'hmh-release'
+    uses: ./.github/workflows/hmh-release.yml
     secrets: inherit
     with:
       repository: ${{ needs.guard.outputs.repository }}

@@ -1,0 +1,91 @@
+name: hmh-release
+
+# hunter-mate-harness(hmh)base 包发布——hmd(huntermate-desktop)内置工作区
+# 三层物化的 base 层来源(hmh-cdn.js 契约:packages/hmh-releases/latest.json)。
+#
+# 触发:router 的 hmh-release 事件;params:
+#   version     语义化版本(必填,须与 hmh 仓 version.json 一致)
+#   notes       发行说明(可选)
+#
+# 产物:七牛 hiredchina-npm-mirror packages/hmh-releases/
+#   v<version>/hmh-<version>.tar.gz(全仓排除 .git/.DS_Store)
+#   latest.json = {version, url, sha256, publishedAt}(hmd fetchLatest 契约)
+#
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓 hunter-mate-harness)、
+# QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
+# dispatcher 自 9/25 死期间手动补发:
+#   gh api repos/hiredchina-com/hc-action-factory/dispatches \
+#     -f event_type=hmh-release \
+#     -f 'client_payload[repository]=hiredchina-com/hunter-mate-harness' \
+#     -f 'client_payload[sha]=<40 位 tag sha>' \
+#     -f 'client_payload[params][version]=x.y.z' [--field 'client_payload[params][notes]=…']
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      params_json:
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: pack + publish hmh base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+      - uses: actions/checkout@v4
+        with:
+          repository: hiredchina-com/hc-action-factory
+          ref: main
+          path: factory
+          fetch-depth: "1"
+      - name: Resolve version + pack tarball
+        id: pack
+        env:
+          PARAMS: ${{ inputs.params_json }}
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version // ""' <<< "$PARAMS")
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "✗ params.version 非法: '$VERSION'"; exit 1; }
+          # version.json 是 hmh 仓的版本 SSOT,tag 与之一致才允许发布(防误发)
+          [[ -f version.json ]] || { echo "✗ hmh 仓缺 version.json(版本 SSOT)"; exit 1; }
+          FILE_VERSION=$(jq -r '.version // ""' version.json)
+          [[ "$FILE_VERSION" == "$VERSION" ]] || { echo "✗ version.json($FILE_VERSION) ≠ params.version($VERSION)"; exit 1; }
+          echo "notes=$(jq -r '.notes // ""' <<< "$PARAMS" | tr '\n' ' ' | cut -c1-500)" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          TARBALL="hmh-${VERSION}.tar.gz"
+          # 全仓打包(排除 VCS/系统垃圾);hmd 侧纯 Node ustar 解包,GNU tar 产物兼容
+          tar -czf "$TARBALL" --exclude=.git --exclude=.DS_Store .
+          SHA=$(sha256sum "$TARBALL" | awk '{print $1}')
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "✓ packed $TARBALL sha256=$SHA"
+      - name: Publish → qiniu CDN
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          NOTES: ${{ steps.pack.outputs.notes }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          set -uo pipefail
+          if [ -z "${QINIU_ACCESS_KEY:-}" ] || [ -z "${QINIU_SECRET_KEY:-}" ]; then
+            echo "✗ 工厂仓未配置 QINIU keys,拒绝发布(tarball 见上方日志可补发)"; exit 1
+          fi
+          ARGS=(--version "$VERSION" --file "$TARBALL" --sha256 "$SHA256" \
+            --bucket hiredchina-npm-mirror \
+            --key-prefix packages/hmh-releases --keep 10 \
+            --base-url https://npm.hiredchina.com --notes "$NOTES")
+          node factory/scripts/qiniu-hmh-release.mjs "${ARGS[@]}"
