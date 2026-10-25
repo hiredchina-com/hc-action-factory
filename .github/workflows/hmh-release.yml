@@ -91,3 +91,11 @@ jobs:
             --key-prefix packages/hmh-releases --keep 10 \
             --base-url https://npm.hiredchina.com --notes "$NOTES")
           node factory/scripts/qiniu-hmh-release.mjs "${ARGS[@]}"
+          rc=$?
+          # 发布脚本退出码约定:0 全绿;2 有降级(七牛管理接口 401/fusion 刷新失败,
+          # 发布本体已成功——首跑实证);1 硬失败。2 视为成功但留警告。
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::hmh release $VERSION 发布成功但有降级项(见上方 ⚠ 日志)"
+            exit 0
+          fi
+          exit "$rc"
