@@ -64,8 +64,10 @@ jobs:
           [[ "$FILE_VERSION" == "$VERSION" ]] || { echo "✗ version.json($FILE_VERSION) ≠ params.version($VERSION)"; exit 1; }
           echo "notes=$(jq -r '.notes // ""' <<< "$PARAMS" | tr '\n' ' ' | cut -c1-500)" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          TARBALL="hmh-${VERSION}.tar.gz"
-          # 全仓打包(排除 VCS/系统垃圾);hmd 侧纯 Node ustar 解包,GNU tar 产物兼容
+          TARBALL="$RUNNER_TEMP/hmh-${VERSION}.tar.gz"
+          # 全仓打包(排除 VCS/系统垃圾);hmd 侧纯 Node ustar 解包,GNU tar 产物兼容。
+          # 产物必须写 $RUNNER_TEMP:写仓内会被 tar 自己读到(目录在读取期间变化,
+          # "file changed as we read it" 直接失败——hmh-release 首跑实证)
           tar -czf "$TARBALL" --exclude=.git --exclude=.DS_Store .
           SHA=$(sha256sum "$TARBALL" | awk '{print $1}')
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
