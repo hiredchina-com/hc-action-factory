@@ -105,7 +105,14 @@ async function withRetry(label, fn, attempts = 5) {
 async function uploadFile(key, filePath) {
   const token = uploadToken(key);
   const size = fs.statSync(filePath).size;
-  const encKey = encodeURIComponent(key);
+  // 对象名编码两种候选(qiniu 文档/SDK 版本间不一致,社区实证并存):
+  //   A) encodeURIComponent   B) URLSafeBase64(key)
+  // 每轮按序试,任一 init 成功即锁定;一次运行内自适应收敛。
+  const encCandidates = [
+    encodeURIComponent(key),
+    b64u(Buffer.from(key, 'utf8')),
+  ];
+  let encIdx = 0;
   const totalParts = Math.max(1, Math.ceil(size / PART_SIZE));
   const etags = new Array(totalParts).fill(null);
   let uploadId = null;
@@ -115,13 +122,18 @@ async function uploadFile(key, filePath) {
     for (let round = 1; round <= 12; round++) {
       let progressed = false;
       for (const host of UPLOAD_HOSTS) {
-        const base = `https://${host}/buckets/${BUCKET}/objects/${encKey}/uploads`;
-        try {
-          if (!uploadId) {
-            uploadId = JSON.parse(upCurl(host, ['-X', 'POST', base, '-H', `Authorization: UpToken ${token}`])).uploadId;
-            console.log(`✓ init uploadId=${uploadId.slice(0, 12)}…(${totalParts} 片)`);
-          }
-          for (let part = 1; part <= totalParts; part++) {
+        // 编码锁定(uploadId 已建)→ 只用锁定值;未锁定 → 逐候选试 init
+        const eiList = uploadId ? [encIdx] : encCandidates.map((_, i) => i);
+        for (const ei of eiList) {
+          const encKey = encCandidates[ei];
+          const base = `https://${host}/buckets/${BUCKET}/objects/${encKey}/uploads`;
+          try {
+            if (!uploadId) {
+              uploadId = JSON.parse(upCurl(host, ['-X', 'POST', base, '-H', `Authorization: UpToken ${token}`])).uploadId;
+              encIdx = ei;
+              console.log(`✓ init uploadId=${uploadId.slice(0, 12)}…(${totalParts} 片, 编码=${ei === 0 ? 'urlenc' : 'b64'})`);
+            }
+            for (let part = 1; part <= totalParts; part++) {
             if (etags[part - 1]) continue;
             const buf = Buffer.alloc(Math.min(PART_SIZE, size - (part - 1) * PART_SIZE));
             fs.readSync(fd, buf, 0, buf.length, (part - 1) * PART_SIZE);
@@ -152,6 +164,7 @@ async function uploadFile(key, filePath) {
             return JSON.parse(done);
           }
         } catch (e) { console.log(`⚠ ${host} round ${round}: ${e.message}`); }
+        }
       }
       if (!progressed) console.log(`⚠ round ${round} 无进展,退避后重试`);
       if (round < 12) await new Promise((r) => setTimeout(r, Math.min(60_000, 5000 * round)));
