@@ -364,8 +364,8 @@ jobs:
           DIR=$(jq -r '.package_dir // "packages/cli"' <<< "$MIRROR")
           NAME=$(node -p "require('./${DIR}/package.json').name")
           # hmh#58/0.1.17 实证:本地 pack 源码目录打出 2.4kB 残缺包(files 限定
-          # dist/ 而本 job 不构建);改从 registry 拉已发布 tgz(脚本内 12×5s
-          # 重试吞发布后的索引延迟),镜像===用户实际装到的包
+          # dist/ 而本 job 不构建);改从 registry 拉已发布 tgz(脚本内 24 次线性退避
+          # 5s→30s ≈11min 预算吞索引延迟——0.1.29/0.1.30 实证 12×5s 不够),镜像===用户实际装到的包
           node qiniu-release-mirror.mjs \
             --dir "$DIR" \
             --pack-spec "${NAME}@${VERSION}" \

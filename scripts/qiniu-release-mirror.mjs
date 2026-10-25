@@ -10,7 +10,8 @@
 //        (hmh#58/0.1.17 发布实证:本地 npm pack 源码目录会打出残缺包——
 //        files 字段限定 dist/ 而 mirror job 只检出源码不构建,2.4kB 3 文件
 //        坏包直接上 CDN latest.json;registry 拉取才保证镜像===用户实际装到
-//        的包;发布岗位刚写完元数据,索引有秒级延迟,12×5s 重试)
+//        的包;发布岗位刚写完元数据,索引有秒级~分钟级延迟,24 次线性退避
+//        (5s 起步 30s 封顶,≈11min 预算)重试——0.1.29/0.1.30 实证 60s 不够)
 //      - 回退(--pack-spec 省略):npm pack <package_dir> 本地打包(仅当目录
 //        已构建时安全)
 //   2. 上传到 <bucket>:<key_prefix>/<tgz>
@@ -294,8 +295,12 @@ try {
   //    时回退本地 npm pack(仅当该目录已构建才安全)
   let out;
   if (PACK_SPEC) {
+    // registry 索引传播预算:0.1.29/0.1.30 连续实证 npm 写完元数据到 pack 可拉
+    // 超过 60s(12×5s 全耗尽),镜像缺失 latest.json 不刷新。线性退避 5s 起步 30s 封顶,
+    // 24 次 ≈ 11min 预算,吃满常规传播延迟;仍失败=真问题,硬失败留痕。
+    const ATTEMPTS = 24;
     let lastErr = null;
-    for (let attempt = 1; attempt <= 12; attempt++) {
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       try {
         out = execFileSync('npm', ['pack', PACK_SPEC, '--pack-destination', tmp],
           { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 })
@@ -304,11 +309,11 @@ try {
       } catch (err) {
         lastErr = err;
         const stderr = String(err.stderr || '').trim().split('\n').pop();
-        console.log(`registry pack ${PACK_SPEC} 第 ${attempt}/12 次未就绪: ${stderr || err.message}`);
-        await new Promise((r) => setTimeout(r, 5000));
+        console.log(`registry pack ${PACK_SPEC} 第 ${attempt}/${ATTEMPTS} 次未就绪: ${stderr || err.message}`);
+        await new Promise((r) => setTimeout(r, Math.min(5000 * attempt, 30_000)));
       }
     }
-    if (!out) throw new Error(`npm pack ${PACK_SPEC} 失败(registry 索引延迟或发布未成功)`);
+    if (!out) throw new Error(`npm pack ${PACK_SPEC} 失败(registry 索引延迟超 11min 预算或发布未成功)`);
   } else {
     out = execFileSync('npm', ['pack', '--pack-destination', tmp], { cwd: PKG_DIR, encoding: 'utf-8', timeout: 180_000 }).trim().split('\n').pop().trim();
   }
