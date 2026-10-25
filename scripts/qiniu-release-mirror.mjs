@@ -14,7 +14,8 @@
 //        (5s 起步 30s 封顶,≈11min 预算)重试——0.1.29/0.1.30 实证 60s 不够)
 //      - 回退(--pack-spec 省略):npm pack <package_dir> 本地打包(仅当目录
 //        已构建时安全)
-//   2. 上传到 <bucket>:<key_prefix>/<tgz>
+//   2. 上传到 <bucket>:<key_prefix>/<tgz>(curl 传输层;runner 直连被 IP 级封禁时
+//      可经 QINIU_UPLOAD_CONNECT_TO_MAP 走 SSH -L 隧道 relay——见 CONNECT_TO_MAP)
 //   3. 镜像原生依赖(FID-116):发布包 dependencies/optionalDependencies 里的包
 //      及一层内带 install 脚本的原生传递依赖,npm tarball 传到 <key_prefix>/native/,
 //      登记进 latest.json.nativeDeps,供国内安装路径零 registry 下载
@@ -75,6 +76,21 @@ const UPLOAD_HOSTS = arg('upload-host', '')
   ? [arg('upload-host', '')]
   : ['up-z2.qiniup.com', 'up-z0.qiniup.com', 'up.qiniup.com'];
 
+/**
+ * SSH 隧道映射(env QINIU_UPLOAD_CONNECT_TO_MAP):"host=127.0.0.1:port,..."——
+ * runner 直连被 IP 级封禁时(0.1.30 实证 up* 三主机 curl 全 70s 超时),工作流经
+ * cloudflared+JP 服务器建 -L 隧道,上传流量借道自有服务器出口;TLS 仍端到端
+ * (curl --connect-to 只改 TCP 落点,SNI/证书校验不变)。未配置=直连(本地/旧路径)。
+ */
+const CONNECT_TO_MAP = Object.fromEntries(
+  (process.env.QINIU_UPLOAD_CONNECT_TO_MAP || '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .map((pair) => pair.split('=').map((s) => s.trim()))
+    .filter(([h, t]) => h && t),
+);
+const connectToArgs = (host) =>
+  CONNECT_TO_MAP[host] ? ['--connect-to', `${host}:443:${CONNECT_TO_MAP[host]}`] : [];
+
 const AK = process.env.QINIU_ACCESS_KEY || '';
 const SK = process.env.QINIU_SECRET_KEY || '';
 if (!AK || !SK) { console.error('✗ QINIU_ACCESS_KEY/QINIU_SECRET_KEY 未设置'); process.exit(1); }
@@ -133,6 +149,7 @@ async function uploadFile(key, filePath) {
       return await withRetry(`upload ${key}@${host}`, async () => {
         const out = execFileSync('curl', [
           '-fsS', '--max-time', '70', '-X', 'POST', `https://${host}`,
+          ...connectToArgs(host),
           '-F', `token=${uploadToken(key)}`,
           '-F', `key=${key}`,
           '-F', `file=@${filePath}`,

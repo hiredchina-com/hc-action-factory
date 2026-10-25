@@ -349,6 +349,52 @@ jobs:
         with:
           node-version: "22"
 
+      # 0.1.30 实证:GitHub runner 出口到七牛 up* 上传域被 IP 级掐死(curl/undici
+      # 双传输层、三主机 fallback 链全 70s 超时;本地同代码秒过)。复用
+      # docker-acr-deploy 的 cloudflared+JP 服务器通道建 SSH -L 隧道,上传流量借道
+      # 自有服务器出口;脚本侧 QINIU_UPLOAD_CONNECT_TO_MAP 让 curl --connect-to
+      # 改 TCP 落点,TLS/SNI 仍端到端。隧道建不起来不硬失败——直连可能已恢复。
+      - name: Setup cloudflared & SSH tunnel to JP (qiniu upload relay)
+        continue-on-error: true
+        env:
+          RELAY_HOST: jp-ssh.hiredchina.com
+        run: |
+          set -euo pipefail
+          sudo curl -sL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          sudo chmod +x /usr/local/bin/cloudflared
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.JP_DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.JP_SERVER_HOST_KEY }}" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host $RELAY_HOST
+            User deployer
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+          EOF
+          chmod 600 ~/.ssh/config
+          # 一条 ssh 承载三个 up 主机的本地端口转发(隧道只搬 TCP,TLS 端到端)
+          nohup ssh -N \
+            -L 127.0.0.1:18080:up-z2.qiniup.com:443 \
+            -L 127.0.0.1:18081:up-z0.qiniup.com:443 \
+            -L 127.0.0.1:18082:up.qiniup.com:443 \
+            "$RELAY_HOST" > /tmp/qiniu-tunnel.log 2>&1 &
+          # 等隧道就绪(本地端口开始监听)再往下;就绪才把映射写进后续 step 环境,
+          # 未就绪不写 = 脚本直连(隧道残留映射比没有更糟:全链 connection refused)
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/18080) 2>/dev/null; then
+              echo "✓ qiniu upload tunnel ready (127.0.0.1:18080-18082 via $RELAY_HOST)"
+              echo "QINIU_UPLOAD_CONNECT_TO_MAP=up-z2.qiniup.com=127.0.0.1:18080,up-z0.qiniup.com=127.0.0.1:18081,up.qiniup.com=127.0.0.1:18082" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "⚠ 隧道 30s 未就绪,退回直连(runner→七牛可能已恢复)"
+
       - name: npm pack + upload + prune + refresh
         env:
           QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
