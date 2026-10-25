@@ -1,0 +1,33 @@
+name: net-probe
+
+# 出网诊断(workflow_dispatch):从 GitHub runner 探测指定端点连通性。
+# 背景:runner→七牛 up* 域间歇/持续被掐(curl 70s 全超时,本地秒过),需要
+# 低成本验证「哪条路径还活着」,避免每次靠整轮 release 试。一次可探多个端点。
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "逗号分隔的 host 列表(可带 :port,默认 443)"
+        required: true
+        default: "up-z2.qiniup.com,rsf.qiniu.com"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: TCP + HTTPS probe
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+        run: |
+          set -u
+          for t in ${TARGETS//,/ }; do
+            host="${t%%:*}"
+            port="${t##*:}"; [ "$port" = "$host" ] && port=443
+            echo "== $host:$port =="
+            # TCP 连通(TLS 前的短板):5s 预算
+            timeout 5 bash -c "(echo > /dev/tcp/$host/$port)" 2>/dev/null \
+              && echo "  TCP: open" || { echo "  TCP: FAIL/timeout"; continue; }
+            # HTTPS 全链(含 SNI/响应):10s 预算,只看状态码
+            code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$host:$port/" 2>/dev/null || echo CURL_FAIL)
+            echo "  HTTPS: $code"
+          done
