@@ -76,9 +76,16 @@ const PART_MAX_TIME = '300';
 const PART_TIMEOUT = 330_000;
 
 function upCurl(host, args, opts = {}) {
-  return execFileSync('curl', ['-fsS', '--max-time', PART_MAX_TIME, ...args], {
-    encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: PART_TIMEOUT, ...opts,
-  }).trim();
+  const tmp = path.join(os.tmpdir(), `qiniu-res-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  try {
+    // 诊断优先:失败必须看到 HTTP 状态码+响应体(-f 会吞掉 4xx body,故用 -w 取码)
+    const code = execFileSync('curl', ['-sS', '--max-time', PART_MAX_TIME, '-o', tmp, '-w', '%{http_code}', ...args], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: PART_TIMEOUT, ...opts,
+    }).trim();
+    const body = fs.readFileSync(tmp, 'utf8');
+    if (!code.startsWith('2')) throw new Error(`HTTP ${code}: ${body.slice(0, 300) || '<空>'}`);
+    return body;
+  } finally { fs.rmSync(tmp, { force: true }); }
 }
 
 async function withRetry(label, fn, attempts = 5) {
