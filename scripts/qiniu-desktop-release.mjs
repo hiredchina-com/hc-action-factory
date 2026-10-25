@@ -79,10 +79,12 @@ const PART_TIMEOUT = 330_000;
 
 function upCurl(host, args, opts = {}) {
   const tmp = path.join(os.tmpdir(), `qiniu-res-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  const maxTime = opts.maxTime || PART_MAX_TIME;
+  const hardTimeout = opts.timeout || PART_TIMEOUT;
   try {
     // 诊断优先:失败必须看到 HTTP 状态码+响应体(-f 会吞掉 4xx body,故用 -w 取码)
-    const code = execFileSync('curl', ['-sS', '--max-time', PART_MAX_TIME, '-o', tmp, '-w', '%{http_code}', ...args], {
-      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: PART_TIMEOUT, ...opts,
+    const code = execFileSync('curl', ['-sS', '--max-time', maxTime, '-o', tmp, '-w', '%{http_code}', ...args], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: hardTimeout,
     }).trim();
     const body = fs.readFileSync(tmp, 'utf8');
     if (!code.startsWith('2')) throw new Error(`HTTP ${code}: ${body.slice(0, 300) || '<空>'}`);
@@ -102,7 +104,37 @@ async function withRetry(label, fn, attempts = 5) {
   throw last;
 }
 
+/** 单连接 form 上传(保底路径):v0.1.4/0.1.5 实证可用的最后手段;FID-137 节流下靠
+ *  900s 长超时 + 跨主机轮询赌快窗,慢但必达。分片 v2 认证若未来修好,优先走分片。 */
+async function uploadFileMonolithic(key, filePath) {
+  let last = null;
+  for (const host of UPLOAD_HOSTS) {
+    try {
+      return await withRetry(`upload ${key}@${host}`, async () => {
+        const out = upCurl(host, [
+          '-X', 'POST', `https://${host}`,
+          '-F', `token=${uploadToken(key)}`,
+          '-F', `key=${key}`,
+          '-F', `file=@${filePath}`,
+        ], { maxTime: '900', timeout: 960_000 }).trim();
+        return JSON.parse(out);
+      }, 2);
+    } catch (e) { last = e; console.log(`✗ ${host} 上传失败: ${e.message}`); }
+  }
+  throw last;
+}
+
 async function uploadFile(key, filePath) {
+  try {
+    return await uploadFileMultipart(key, filePath);
+  } catch (e) {
+    console.log(`⚠ 分片 v2 不可用(${e.message}),回退单连接 form 上传(慢但保底)`);
+    return uploadFileMonolithic(key, filePath);
+  }
+}
+
+async function uploadFileMultipart(key, filePath) {
+  const MULTI_PART_ROUNDS = 2;
   const token = uploadToken(key);
   const size = fs.statSync(filePath).size;
   // 对象名编码两种候选(qiniu 文档/SDK 版本间不一致,社区实证并存):
@@ -119,7 +151,7 @@ async function uploadFile(key, filePath) {
   const fd = fs.openSync(filePath, 'r');
   try {
     // 多轮×多主机:同一 uploadId 跨主机续传(片已落服务器的跳过),吃满封禁抖动窗口
-    for (let round = 1; round <= 12; round++) {
+    for (let round = 1; round <= MULTI_PART_ROUNDS; round++) {
       let progressed = false;
       for (const host of UPLOAD_HOSTS) {
         // 编码锁定(uploadId 已建)→ 只用锁定值;未锁定 → 逐候选试 init
@@ -167,9 +199,9 @@ async function uploadFile(key, filePath) {
         }
       }
       if (!progressed) console.log(`⚠ round ${round} 无进展,退避后重试`);
-      if (round < 12) await new Promise((r) => setTimeout(r, Math.min(60_000, 5000 * round)));
+      if (round < MULTI_PART_ROUNDS) await new Promise((r) => setTimeout(r, Math.min(60_000, 5000 * round)));
     }
-    throw new Error(`分片上传 12 轮仍未完成(${etags.filter(Boolean).length}/${totalParts} 片)`);
+    throw new Error(`分片上传 ${MULTI_PART_ROUNDS} 轮仍未完成(${etags.filter(Boolean).length}/${totalParts} 片)`);
   } finally { fs.closeSync(fd); }
 }
 
