@@ -49,7 +49,9 @@ if (!AK || !SK) { console.error('✗ QINIU_ACCESS_KEY/QINIU_SECRET_KEY 未设置
 if (!VERSION) { console.error('✗ --version 必填'); process.exit(1); }
 if (!MAC_FILE && !WIN_FILE) { console.error('✗ --mac-file/--win-file 至少其一'); process.exit(1); }
 
-const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+// qiniu base64url 规范:无 padding;v2 分片 API 对 token 第三段严格解码,留 = 即
+// 400 illegal base64(2026-10-25 v0.1.5 实证);form 上传容忍但一并按规范剥离
+const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\//g, '_').replace(/\+/g, '-').replace(/=+$/, '');
 const hmac = (data) => createHmac('sha1', SK).update(data).digest();
 
 function qboxSign(method, pathAndQuery, host, headers = {}, body = '') {
