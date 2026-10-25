@@ -84,12 +84,14 @@ async function uploadFile(key, filePath) {
   for (const host of UPLOAD_HOSTS) {
     try {
       return await withRetry(`upload ${key}@${host}`, async () => {
+        // FID-137:封禁窗口内带宽极低,314MB dmg 需要长超时;120s 上限是 v0.1.5 双平台
+        // 构建全绿但发布连败的根因。管理接口(qbox/fusion)仍用 30s 短超时不受影响。
         const out = execFileSync('curl', [
-          '-fsS', '--max-time', '120', '-X', 'POST', `https://${host}`,
+          '-fsS', '--max-time', '900', '-X', 'POST', `https://${host}`,
           '-F', `token=${uploadToken(key)}`,
           '-F', `key=${key}`,
           '-F', `file=@${filePath}`,
-        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 150_000 }).trim();
+        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 960_000 }).trim();
         return JSON.parse(out);
       }, 2);
     } catch (e) { last = e; console.log(`✗ ${host} 上传失败: ${e.message}`); }
