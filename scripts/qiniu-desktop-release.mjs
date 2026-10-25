@@ -67,6 +67,20 @@ function uploadToken(key) {
   return `${AK}:${b64u(hmac(encoded))}:${encoded}`;
 }
 
+// FID-137 续:封禁窗口内握手可通但单连接被节流到 <0.35MB/s,314MB dmg 单次 POST 永无可能在
+// 900s 内跑完(v0.1.5 实证:窗口开放期连探 3h 无一次成功)。改七牛分片上传 v2:
+// initParts → 每片独立 PUT(失败按主机轮换,吃满抖动窗口)→ completeParts;
+// 单片的重试粒度把"整文件一次押注"拆成几十次小押注,任一片超时不再拖死整文件。
+const PART_SIZE = 8 * 1024 * 1024;
+const PART_MAX_TIME = '300';
+const PART_TIMEOUT = 330_000;
+
+function upCurl(host, args, opts = {}) {
+  return execFileSync('curl', ['-fsS', '--max-time', PART_MAX_TIME, ...args], {
+    encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: PART_TIMEOUT, ...opts,
+  }).trim();
+}
+
 async function withRetry(label, fn, attempts = 5) {
   let last = null;
   for (let i = 1; i <= attempts; i++) {
@@ -80,23 +94,61 @@ async function withRetry(label, fn, attempts = 5) {
 }
 
 async function uploadFile(key, filePath) {
-  let last = null;
-  for (const host of UPLOAD_HOSTS) {
-    try {
-      return await withRetry(`upload ${key}@${host}`, async () => {
-        // FID-137:封禁窗口内带宽极低,314MB dmg 需要长超时;120s 上限是 v0.1.5 双平台
-        // 构建全绿但发布连败的根因。管理接口(qbox/fusion)仍用 30s 短超时不受影响。
-        const out = execFileSync('curl', [
-          '-fsS', '--max-time', '900', '-X', 'POST', `https://${host}`,
-          '-F', `token=${uploadToken(key)}`,
-          '-F', `key=${key}`,
-          '-F', `file=@${filePath}`,
-        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 960_000 }).trim();
-        return JSON.parse(out);
-      }, 2);
-    } catch (e) { last = e; console.log(`✗ ${host} 上传失败: ${e.message}`); }
-  }
-  throw last;
+  const token = uploadToken(key);
+  const size = fs.statSync(filePath).size;
+  const encKey = encodeURIComponent(key);
+  const totalParts = Math.max(1, Math.ceil(size / PART_SIZE));
+  const etags = new Array(totalParts).fill(null);
+  let uploadId = null;
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    // 多轮×多主机:同一 uploadId 跨主机续传(片已落服务器的跳过),吃满封禁抖动窗口
+    for (let round = 1; round <= 12; round++) {
+      let progressed = false;
+      for (const host of UPLOAD_HOSTS) {
+        const base = `https://${host}/buckets/${BUCKET}/objects/${encKey}/uploads`;
+        try {
+          if (!uploadId) {
+            uploadId = JSON.parse(upCurl(host, ['-X', 'POST', base, '-H', `Authorization: UpToken ${token}`])).uploadId;
+            console.log(`✓ init uploadId=${uploadId.slice(0, 12)}…(${totalParts} 片)`);
+          }
+          for (let part = 1; part <= totalParts; part++) {
+            if (etags[part - 1]) continue;
+            const buf = Buffer.alloc(Math.min(PART_SIZE, size - (part - 1) * PART_SIZE));
+            fs.readSync(fd, buf, 0, buf.length, (part - 1) * PART_SIZE);
+            const tmp = path.join(os.tmpdir(), `qiniu-part-${process.pid}-${part}`);
+            fs.writeFileSync(tmp, buf);
+            try {
+              const etag = upCurl(host, [
+                '-X', 'PUT', `${base}/${uploadId}/${part}`,
+                '-H', `Authorization: UpToken ${token}`,
+                '-H', 'Content-Type: application/octet-stream',
+                '--data-binary', `@${tmp}`,
+              ]);
+              etags[part - 1] = JSON.parse(etag).etag;
+              progressed = true;
+              if (part % 5 === 0 || part === totalParts) console.log(`✓ part ${part}/${totalParts}`);
+            } catch (e) {
+              console.log(`⚠ part ${part}/${totalParts}@${host}: ${e.message}`);
+            } finally { fs.rmSync(tmp, { force: true }); }
+          }
+          if (etags.every(Boolean)) {
+            const body = JSON.stringify({ parts: etags.map((etag, i) => ({ partNumber: i + 1, etag })) });
+            const done = upCurl(host, [
+              '-X', 'POST', `${base}/${uploadId}/complete`,
+              '-H', `Authorization: UpToken ${token}`,
+              '-H', 'Content-Type: application/json',
+              '--data', body,
+            ]);
+            return JSON.parse(done);
+          }
+        } catch (e) { console.log(`⚠ ${host} round ${round}: ${e.message}`); }
+      }
+      if (!progressed) console.log(`⚠ round ${round} 无进展,退避后重试`);
+      if (round < 12) await new Promise((r) => setTimeout(r, Math.min(60_000, 5000 * round)));
+    }
+    throw new Error(`分片上传 12 轮仍未完成(${etags.filter(Boolean).length}/${totalParts} 片)`);
+  } finally { fs.closeSync(fd); }
 }
 
 /** QBox 管理接口:列目录 */
