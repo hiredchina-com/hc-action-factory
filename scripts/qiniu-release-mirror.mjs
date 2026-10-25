@@ -142,21 +142,32 @@ async function uploadFile(key, filePath) {
   // 传输层实验(0.1.18 实证):undici fetch 上传被 runner→qiniu 全域掐死(3 域×多轮
   // 全 60s 超时,本地同代码秒过)——不能排除 WAF 按 TLS/HTTP 指纹封云 ASN。curl 是
   // 完全不同的 TCP/TLS 栈:curl 通=指纹封锁实锤且已绕过;curl 也挂=IP 级封禁坐实。
+  // 0.1.30 补:封禁是间歇性的(net-probe 实证同一 runner 解封时全端点秒开,封禁
+  // 窗口 ≥40min),且 SSH 隧道 relay(jp-ssh 出口)与直连同期同死——故每主机按
+  // 「直连 2 次 → 隧道 2 次(有映射才排)」轮转,吃满抖动窗口内的解封沿口;
+  // 12 次 × 70s ≈ 14min 预算后仍全灭才算真失败。
   // token 仅存活 1h 且 runner 为临空单租户 VM,argv 短暂可见可接受。
-  let last = null;
+  const plan = [];
   for (const host of UPLOAD_HOSTS) {
+    for (let i = 0; i < 2; i++) plan.push({ host, via: 'direct' });
+    if (CONNECT_TO_MAP[host]) for (let i = 0; i < 2; i++) plan.push({ host, via: 'tunnel' });
+  }
+  let last = null;
+  for (const { host, via } of plan) {
     try {
-      return await withRetry(`upload ${key}@${host}`, async () => {
-        const out = execFileSync('curl', [
-          '-fsS', '--max-time', '70', '-X', 'POST', `https://${host}`,
-          ...connectToArgs(host),
-          '-F', `token=${uploadToken(key)}`,
-          '-F', `key=${key}`,
-          '-F', `file=@${filePath}`,
-        ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 }).trim();
-        return JSON.parse(out);
-      }, 2);
-    } catch (err) { last = err; }
+      const out = execFileSync('curl', [
+        '-fsS', '--max-time', '70', '-X', 'POST', `https://${host}`,
+        ...(via === 'tunnel' ? connectToArgs(host) : []),
+        '-F', `token=${uploadToken(key)}`,
+        '-F', `key=${key}`,
+        '-F', `file=@${filePath}`,
+      ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 }).trim();
+      return JSON.parse(out);
+    } catch (err) {
+      last = err;
+      const stderr = String(err.stderr || '').trim().split('\n').pop();
+      console.log(`⚠ upload ${key}@${host}(${via}) 失败: ${stderr || err.message}`);
+    }
   }
   throw last;
 }
