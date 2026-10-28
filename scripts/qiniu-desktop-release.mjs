@@ -105,7 +105,8 @@ async function withRetry(label, fn, attempts = 5) {
 }
 
 /** 单连接 form 上传(保底路径):v0.1.4/0.1.5 实证可用的最后手段;FID-137 节流下靠
- *  900s 长超时 + 跨主机轮询赌快窗,慢但必达。分片 v2 认证若未来修好,优先走分片。 */
+ *  长超时 + 跨主机轮询赌快窗,慢但必达(<=314MB 实证;0.2.0 起 dmg ~650MB 超出
+ *  节流下单连接 900s 押注上限,优先走 v1 分块)。maxTime 提到 5400s 兜底。 */
 async function uploadFileMonolithic(key, filePath) {
   let last = null;
   for (const host of UPLOAD_HOSTS) {
@@ -116,7 +117,7 @@ async function uploadFileMonolithic(key, filePath) {
           '-F', `token=${uploadToken(key)}`,
           '-F', `key=${key}`,
           '-F', `file=@${filePath}`,
-        ], { maxTime: '900', timeout: 960_000 }).trim();
+        ], { maxTime: '5400', timeout: 5_460_000 }).trim();
         return JSON.parse(out);
       }, 2);
     } catch (e) { last = e; console.log(`✗ ${host} 上传失败: ${e.message}`); }
@@ -124,11 +125,85 @@ async function uploadFileMonolithic(key, filePath) {
   throw last;
 }
 
+/** v1 分块上传(mkblk/mkfile):与 form 上传同套 UpToken 认证(FID-137 实证 form 认证
+ *  可用,而分片 v2 init 对该 bucket 恒 401 原因未查明)——绕开 v2 认证坑,兼得
+ *  分块重试粒度。块 4MB(mkblk 单 POST 上限),多连接并行(节流按单连接计,
+ *  QINIU_BLOCK_CONCURRENCY 默认 6,聚合 ~2MB/s 时 650MB ≈ 6min),块 ctx 全部落齐后
+ *  mkfile 一次组装。任一 4MB 块失败只重传该块,不拖死整文件。 */
+const BLOCK_SIZE = 4 * 1024 * 1024;
+const BLOCK_CONCURRENCY = Math.max(1, parseInt(process.env.QINIU_BLOCK_CONCURRENCY || '6', 10) || 6);
+const BLOCK_PART_MAX_TIME = '300';
+const BLOCK_PART_TIMEOUT = 330_000;
+
+async function uploadFileV1Blocks(key, filePath) {
+  const token = uploadToken(key);
+  const size = fs.statSync(filePath).size;
+  const totalBlocks = Math.max(1, Math.ceil(size / BLOCK_SIZE));
+  const ctxs = new Array(totalBlocks).fill(null);
+  const fd = fs.openSync(filePath, 'r');
+  const b64Key = b64u(Buffer.from(key, 'utf8'));
+  try {
+    for (let round = 1; round <= 3 && ctxs.some((c) => !c); round++) {
+      let progressed = false;
+      for (const host of UPLOAD_HOSTS) {
+        try {
+          let next = 0;
+          const worker = async () => {
+            for (;;) {
+              const idx = next++;
+              if (idx >= totalBlocks) return;
+              if (ctxs[idx]) continue;
+              const off = idx * BLOCK_SIZE;
+              const len = Math.min(BLOCK_SIZE, size - off);
+              const buf = Buffer.alloc(len);
+              fs.readSync(fd, buf, 0, len, off);
+              const tmp = path.join(os.tmpdir(), `qiniu-blk-${process.pid}-${idx}`);
+              fs.writeFileSync(tmp, buf);
+              try {
+                const out = upCurl(host, [
+                  '-X', 'POST', `https://${host}/mkblk/${len}`,
+                  '-H', `Authorization: UpToken ${token}`,
+                  '-H', 'Content-Type: application/octet-stream',
+                  '--data-binary', `@${tmp}`,
+                ], { maxTime: BLOCK_PART_MAX_TIME, timeout: BLOCK_PART_TIMEOUT });
+                ctxs[idx] = JSON.parse(out).ctx;
+                progressed = true;
+                if ((idx + 1) % 10 === 0 || idx + 1 === totalBlocks) console.log(`✓ blk ${idx + 1}/${totalBlocks}`);
+              } catch (e) {
+                console.log(`⚠ blk ${idx + 1}/${totalBlocks}@${host}: ${e.message}`);
+              } finally { fs.rmSync(tmp, { force: true }); }
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(BLOCK_CONCURRENCY, totalBlocks) }, worker));
+          if (ctxs.every(Boolean)) {
+            const done = upCurl(host, [
+              '-X', 'POST', `https://${host}/mkfile/${size}/key/${b64Key}`,
+              '-H', `Authorization: UpToken ${token}`,
+              '-H', 'Content-Type: text/plain',
+              '--data-binary', ctxs.join(','),
+            ], { maxTime: '120', timeout: 130_000 });
+            return JSON.parse(done);
+          }
+        } catch (e) { console.log(`⚠ ${host} v1 round ${round}: ${e.message}`); }
+        if (ctxs.every(Boolean)) break;
+      }
+      if (!progressed) console.log(`⚠ v1 round ${round} 无进展,退避后重试`);
+      if (round < 3) await new Promise((r) => setTimeout(r, Math.min(60_000, 5000 * round)));
+    }
+    throw new Error(`v1 分块 3 轮仍未完成(${ctxs.filter(Boolean).length}/${totalBlocks} 块)`);
+  } finally { fs.closeSync(fd); }
+}
+
 async function uploadFile(key, filePath) {
   try {
     return await uploadFileMultipart(key, filePath);
   } catch (e) {
-    console.log(`⚠ 分片 v2 不可用(${e.message}),回退单连接 form 上传(慢但保底)`);
+    console.log(`⚠ 分片 v2 不可用(${e.message}),改 v1 分块(mkblk/mkfile)`);
+  }
+  try {
+    return await uploadFileV1Blocks(key, filePath);
+  } catch (e) {
+    console.log(`⚠ v1 分块失败(${e.message}),回退单连接 form 上传(慢但保底)`);
     return uploadFileMonolithic(key, filePath);
   }
 }
