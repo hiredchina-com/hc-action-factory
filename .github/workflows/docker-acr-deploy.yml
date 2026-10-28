@@ -19,6 +19,8 @@ name: pipeline/docker-acr-deploy
 #   "health_url": "https://example.com/",   # 可选:部署后轮询该 URL 至 health_expect(默认 200)
 #   "health_expect": 200,                    # 可选:期望状态码
 #   "health_patience_min": 5,                # 可选:轮询耐心(分钟),超时判部署失败
+#   "health_via_ssh": true,                  # 可选:改经 ssh 探 params.health_origin_url
+#   "health_origin_url": "http://127.0.0.1:3004/",  # 可选:源站本地地址(runner 公网被 WAF 拦时用)
 #   "notify": {"start": true, "finish": "always"}
 # }
 #
@@ -200,6 +202,10 @@ jobs:
       # 事故实录:compose up 后 docker ps 必显 Running(崩溃有数秒延迟),remote_script 恒成功,
       # 而容器 Nest DI 失败 crash-loop 约 1.5h 无人知,全站 502。
       # 设了 params.health_url 才启用;轮询到期望状态码才算部署成功,失败走 Rollback hint。
+      # params.health_via_ssh=true 时改经 Deploy 步已建好的 ssh 通道探源站
+      # (params.health_origin_url,缺省 http://127.0.0.1:3004/):
+      # 2026-10-28 实证 GitHub runner 公网探 https://dev-ops.hiredchina.com/ 被 Cloudflare
+      # WAF 持续 403(run 40703795933,源站实际健康),datacenter ASN 被拦,公网探针不可用。
       - name: Post-deploy health check
         if: fromJSON(inputs.params_json).health_url != null
         timeout-minutes: ${{ fromJSON(inputs.params_json).health_patience_min || 5 }}
@@ -211,12 +217,21 @@ jobs:
           HEALTH_URL=$(jq -r '.health_url' <<< "$PARAMS")
           EXPECT=$(jq -r '.health_expect // 200' <<< "$PARAMS")
           PATIENCE_S=$(( $(jq -r '.health_patience_min // 5' <<< "$PARAMS") * 60 ))
-          echo "→ post-deploy health: $HEALTH_URL expect=$EXPECT patience=${PATIENCE_S}s (sha=$SHA)"
+          if [[ "$(jq -r '.health_via_ssh // false' <<< "$PARAMS")" == "true" ]]; then
+            SERVER_HOST=$(jq -r '.server_host' <<< "$PARAMS")
+            HEALTH_URL=$(jq -r '.health_origin_url // "http://127.0.0.1:3004/"' <<< "$PARAMS")
+            probe() { ssh "$SERVER_HOST" \
+              "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Accept: text/html' '$HEALTH_URL'" 2>&1 || true; }
+            echo "→ post-deploy health (via ssh origin): $HEALTH_URL expect=$EXPECT patience=${PATIENCE_S}s (sha=$SHA)"
+          else
+            probe() { curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+              -H 'Accept: text/html' "$HEALTH_URL" 2>&1 || true; }
+            echo "→ post-deploy health: $HEALTH_URL expect=$EXPECT patience=${PATIENCE_S}s (sha=$SHA)"
+          fi
           deadline=$(( $(date +%s) + PATIENCE_S ))
           last=""
           while (( $(date +%s) < deadline )); do
-            last=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-              -H 'Accept: text/html' "$HEALTH_URL" 2>&1 || true)
+            last=$(probe)
             if [[ "$last" == "$EXPECT" ]]; then
               echo "✓ healthy: $HEALTH_URL → $last"
               exit 0
