@@ -85,6 +85,11 @@ jobs:
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
         run: npx electron-builder --mac dmg --arm64 --publish never
+      - name: 打包产物门禁 (electron-builder 会静默丢 extraResources 源顶层 node_modules,v0.1.5 实证)
+        run: |
+          set -euo pipefail
+          APP_RES=$(ls -d dist/mac*/HunterMate.app/Contents/Resources | head -1)
+          node scripts/assert-packaged-hm-server.mjs "$APP_RES"
       - name: Locate + hash artifact
         id: art
         run: |
@@ -131,6 +136,11 @@ jobs:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
         shell: bash
         run: npx electron-builder --win nsis --x64 --publish never
+      - name: 打包产物门禁 (electron-builder 会静默丢 extraResources 源顶层 node_modules,v0.1.5 实证)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/assert-packaged-hm-server.mjs dist/win-unpacked/resources
       - name: Locate + hash artifact
         id: art
         shell: bash
