@@ -49,9 +49,13 @@ if (!AK || !SK) { console.error('✗ QINIU_ACCESS_KEY/QINIU_SECRET_KEY 未设置
 if (!VERSION) { console.error('✗ --version 必填'); process.exit(1); }
 if (!MAC_FILE && !WIN_FILE) { console.error('✗ --mac-file/--win-file 至少其一'); process.exit(1); }
 
-// qiniu base64url 规范:无 padding;v2 分片 API 对 token 第三段严格解码,留 = 即
-// 400 illegal base64(2026-10-25 v0.1.5 实证);form 上传容忍但一并按规范剥离
-const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\//g, '_').replace(/\+/g, '-').replace(/=+$/, '');
+// qiniu token 编码:**保留 padding**(2026-11-03 实证修正)。旧实现去 padding,form/mkblk
+// 在 policy JSON 长度 mod 3 != 0 时一律 401 bad token(v0.2.0 四轮发布全灭根因;
+// v0.1.5 纯属 policy 长度碰巧 mod 3 == 0)。对方 AI 的 verify_qiniu.py(带 padding)与
+// 本仓 qiniu-release-mirror/hmh/hmweb 三脚本(均带 padding)全部实证可通。
+// v2 分片 init 历史上"留 = 即 400"的说法与本次实证冲突,且该 bucket v2 init 本就恒 401,
+// 统一带 padding;若未来 v2 可用且报 illegal base64,再为 init 单独剥离。
+const b64u = (buf) => Buffer.from(buf).toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
 const hmac = (data) => createHmac('sha1', SK).update(data).digest();
 
 function qboxSign(method, pathAndQuery, host, headers = {}, body = '') {
