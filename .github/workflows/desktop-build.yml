@@ -81,15 +81,12 @@ jobs:
         run: npm test
       - name: E2E tests (真实应用冷启动全链路;仅 mac——win runner GUI 会话不确定)
         run: npm run test:e2e
+      # 与本地 dist-mac.mjs 同一打包路径:dir 产物 → 产物门禁 → staging(含 beta 首次运行脚本) → UDZO dmg
+      # 2026-11-03 起不再用 electron-builder dmg target:UDZO 手动打包与本地同构,dmg 内容可完全控制
       - name: Build dmg
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
-        run: npx electron-builder --mac dmg --arm64 --publish never
-      - name: 打包产物门禁 (electron-builder 会静默丢 extraResources 源顶层 node_modules,v0.1.5 实证)
-        run: |
-          set -euo pipefail
-          APP_RES=$(ls -d dist/mac*/HunterMate.app/Contents/Resources | head -1)
-          node scripts/assert-packaged-hm-server.mjs "$APP_RES"
+        run: node scripts/dist-mac.mjs
       - name: Locate + hash artifact
         id: art
         run: |
