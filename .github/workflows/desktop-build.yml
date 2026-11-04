@@ -201,9 +201,74 @@ jobs:
           [ -n "$WIN_FILE" ] && ARGS+=(--win-file "$WIN_FILE" --win-sha256 "$WIN_SHA")
           node scripts/qiniu-desktop-release.mjs "${ARGS[@]}"
 
+  # GitHub Release 发布(公开仓 hiredchina-com/huntermate-desktop-releases):
+  # 与七牛镜像并行、互不阻塞——GitHub runner → 七牛可能极慢(v0.2.1 实证 3h),
+  # 而 GitHub Release 上传走 GitHub 自身网络。全自动:构建成功即发 latest。
+  # 令牌:需 secrets.RELEASES_PAT(对 huntermate-desktop-releases 有写权限的 PAT;
+  # GITHUB_TOKEN 不能跨仓)。未配置时本 job 显式失败,提醒补密钥,不静默跳过。
+  publish-github:
+    name: publish → GitHub Release
+    needs: [detect, build-mac, build-win]
+    if: ${{ always() && needs.detect.result == 'success' && (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') && (needs.build-win.result == 'success' || needs.build-win.result == 'skipped') && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-dmg
+          path: artifacts/mac
+        if: ${{ needs.build-mac.result == 'success' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: win-exe
+          path: artifacts/win
+        if: ${{ needs.build-win.result == 'success' }}
+      - name: Publish to GitHub Release + 资产断言门
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          RELEASES_REPO: hiredchina-com/huntermate-desktop-releases
+          VERSION: ${{ needs.detect.outputs.version }}
+          NOTES: ${{ needs.detect.outputs.notes }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "✗ 工厂仓未配置 RELEASES_PAT(对 ${RELEASES_REPO} 有写权限),拒绝发布"; exit 1
+          fi
+          TAG="v${VERSION}"
+          MAC_SRC=""; WIN_SRC=""
+          [ -d artifacts/mac ] && MAC_SRC=$(ls artifacts/mac/*.dmg | head -1)
+          [ -d artifacts/win ] && WIN_SRC=$(ls "artifacts/win"/*.exe | head -1)
+          [ -n "$MAC_SRC" ] && cp "$MAC_SRC" "HunterMate-${VERSION}-mac-arm64.dmg"
+          [ -n "$WIN_SRC" ] && cp "$WIN_SRC" "HunterMate-Setup-${VERSION}-win-x64.exe"
+          # 校验清单(release body 展示 + 断言门基准)
+          : > checksums.txt
+          for f in HunterMate-*; do
+            echo "$(sha256sum "$f" | awk '{print $1}')  $f" >> checksums.txt
+          done
+          NOTES_FILE=$(mktemp)
+          printf '%s\n\n## 校验值(SHA-256)\n\n```\n' "$NOTES" > "$NOTES_FILE"
+          cat checksums.txt >> "$NOTES_FILE"
+          printf '```\n' >> "$NOTES_FILE"
+          # 已存在同 tag release 先删(重发场景;删不掉就失败,不叠资产)
+          gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1 && \
+            gh release delete "$TAG" --repo "$RELEASES_REPO" --yes
+          ASSETS=(HunterMate-*)
+          gh release create "$TAG" --repo "$RELEASES_REPO" --title "$TAG" \
+            --notes-file "$NOTES_FILE" "${ASSETS[@]}"
+          # 断言门:release 资产数 + 逐字节大小必须与本地一致(sha256 已写入 body)
+          gh release view "$TAG" --repo "$RELEASES_REPO" --json assets \
+            --jq '.assets[] | "\(.size) \(.name)"' | sort > released.txt
+          for f in HunterMate-*; do
+            echo "$(stat -c %s "$f") $f" >> local.txt
+          done
+          sort -o local.txt local.txt
+          if ! diff -u local.txt released.txt; then
+            echo "✗ GitHub Release 资产对账失败"; exit 1
+          fi
+          echo "::notice title=publish-github::${RELEASES_REPO} ${TAG} 已发布,资产对账通过"
+
   finalize:
     name: finalize (status)
-    needs: [detect, build-mac, build-win, publish]
+    needs: [detect, build-mac, build-win, publish, publish-github]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -214,11 +279,12 @@ jobs:
           MAC: ${{ needs.build-mac.result }}
           WIN: ${{ needs.build-win.result }}
           PUBLISH: ${{ needs.publish.result }}
+          GITHUB_PUBLISH: ${{ needs.publish-github.result }}
         run: |
           ok_or_skip() { [[ "$1" == "success" || "$1" == "skipped" ]]; }
-          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" ]]; then
+          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" || "$GITHUB_PUBLISH" == "failure" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
-          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" ]]; then
+          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" || "$GITHUB_PUBLISH" == "success" ]]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=error" >> "$GITHUB_OUTPUT"
