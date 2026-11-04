@@ -411,7 +411,7 @@ function semverDesc(a, b) {
     degraded = true;
   }
 
-  try { fusionRefresh([latestKey, ...ROOT_FILES.map((f) => path.basename(f))]); console.log('✓ CDN 刷新 latest.json + 更新清单'); }
+  try { fusionRefresh([latestKey, ...ROOT_FILES.map((f) => `${KEY_PREFIX}/${path.basename(f)}`)]); console.log('✓ CDN 刷新 latest.json + 更新清单'); }
   catch (e) { console.log(`⚠ fusion 刷新失败: ${e.message}`); degraded = true; }
 
   console.log(`✓ desktop release ${VERSION} 发布完成(${Object.keys(assets).join('+') || '无产物'})`);
