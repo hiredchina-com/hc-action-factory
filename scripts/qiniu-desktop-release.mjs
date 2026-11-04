@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 // qiniu-desktop-release.mjs — HunterMate 桌面安装包发布到七牛 CDN
 //
-// 用途:dev-ops 公开下载页(/downloads)的清单源。与 qiniu-release-mirror.mjs
-// 同签名约定,但上传物是本地构建产物(dmg/exe)而非 npm tgz:
-//   1. 上传 v<version>/HunterMate-*.{dmg,exe}(sha256 清单由 pipeline 侧算好传参)
-//   2. 写并上传 latest.json = {version, publishedAt, notes, assets:{mac,win}}
-//   3. 列出现有 v*/ 主包,semver 降序,删除超出 --keep 的旧版本目录
-//   4. CDN 刷新 latest.json(fusion;失败 exit 2 打 warning 不阻断)
+// 用途:dev-ops 公开下载页(/downloads)的清单源 + electron-updater 自动更新源(2026-11)。
+// 与 qiniu-release-mirror.mjs 同签名约定,但上传物是本地构建产物(dmg/exe)而非 npm tgz:
+//   1. 上传 v<version>/HunterMate-*.{dmg,exe,zip}(sha256 清单由 pipeline 侧算好传参)
+//      + --extra-file(可重复):zip/blockmap 等自动更新载体,同入 v<version>/
+//   2. 上传 --root-file(可重复,latest.yml/latest-mac.yml 自动更新清单)→ key-prefix
+//      根目录(electron-updater generic provider 固定取 <url>/latest*.yml);
+//      清单内 files[].url 是相对路径 v<version>/xxx(与第 1 步目录口径衔接)
+//   3. 写并上传 latest.json = {version, publishedAt, notes, assets:{mac,win}}(下载页消费)
+//   4. 列出现有 v*/ 主包,semver 降序,删除超出 --keep 的旧版本目录
+//   5. CDN 刷新 latest.json + 全部 root-file(fusion;失败 exit 2 打 warning 不阻断)
+//
+// 顺序铁律(防客户端拿到指向半同步产物的清单):主包/载体 → root-file 清单 → latest.json。
 //
 // 退出码:0 全绿;2 有降级;1 硬失败(任一上传失败)。
 //
@@ -30,13 +36,24 @@ function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : dflt;
 }
+function argsAll(name) {
+  const out = [];
+  for (let i = 2; i < process.argv.length - 1; i++) {
+    if (process.argv[i] === `--${name}`) out.push(process.argv[i + 1]);
+  }
+  return out;
+}
 
 const VERSION = arg('version', '');
 const MAC_FILE = arg('mac-file', '');
+const MAC_X64_FILE = arg('mac-x64-file', '');
 const WIN_FILE = arg('win-file', '');
 const MAC_SHA = arg('mac-sha256', '');
+const MAC_X64_SHA = arg('mac-x64-sha256', '');
 const WIN_SHA = arg('win-sha256', '');
 const NOTES = arg('notes', '');
+const EXTRA_FILES = argsAll('extra-file');
+const ROOT_FILES = argsAll('root-file');
 const BUCKET = arg('bucket', 'hiredchina-npm-mirror');
 const KEY_PREFIX = arg('key-prefix', 'packages/huntermate-desktop-releases').replace(/\/+$/, '');
 const KEEP = Math.max(1, parseInt(arg('keep', '5'), 10) || 5);
@@ -332,6 +349,10 @@ function semverDesc(a, b) {
     if (!fs.existsSync(MAC_FILE)) { console.error(`✗ mac 安装包不存在: ${MAC_FILE}`); process.exit(1); }
     uploads.push(['mac', MAC_FILE, path.basename(MAC_FILE), MAC_SHA]);
   }
+  if (MAC_X64_FILE) {
+    if (!fs.existsSync(MAC_X64_FILE)) { console.error(`✗ mac x64 安装包不存在: ${MAC_X64_FILE}`); process.exit(1); }
+    uploads.push(['macX64', MAC_X64_FILE, path.basename(MAC_X64_FILE), MAC_X64_SHA]);
+  }
   if (WIN_FILE) {
     if (!fs.existsSync(WIN_FILE)) { console.error(`✗ win 安装包不存在: ${WIN_FILE}`); process.exit(1); }
     uploads.push(['win', WIN_FILE, path.basename(WIN_FILE), WIN_SHA]);
@@ -346,6 +367,22 @@ function semverDesc(a, b) {
       size: fs.statSync(file).size,
     };
     console.log(`✓ 上传 ${key}(${assets[kind].size} 字节)`);
+  }
+
+  // 自动更新载体(zip/blockmap):进 v<version>/,不参与 latest.json 资产形状
+  for (const file of EXTRA_FILES) {
+    if (!fs.existsSync(file)) { console.error(`✗ extra-file 不存在: ${file}`); process.exit(1); }
+    const key = `${KEY_PREFIX}/${versionDir}/${path.basename(file)}`;
+    await withRetry(`upload ${key}`, () => uploadFile(key, file));
+    console.log(`✓ 上传 ${key}(${fs.statSync(file).size} 字节)`);
+  }
+
+  // 自动更新清单(latest.yml/latest-mac.yml):落 key-prefix 根,最后于所有二进制
+  for (const file of ROOT_FILES) {
+    if (!fs.existsSync(file)) { console.error(`✗ root-file 不存在: ${file}`); process.exit(1); }
+    const key = `${KEY_PREFIX}/${path.basename(file)}`;
+    await withRetry(`upload ${key}`, () => uploadFile(key, file));
+    console.log(`✓ 上传 ${key}`);
   }
 
   const latest = { version: VERSION, publishedAt, notes: NOTES || undefined, assets };
@@ -374,7 +411,7 @@ function semverDesc(a, b) {
     degraded = true;
   }
 
-  try { fusionRefresh([latestKey]); console.log('✓ CDN 刷新 latest.json'); }
+  try { fusionRefresh([latestKey, ...ROOT_FILES.map((f) => path.basename(f))]); console.log('✓ CDN 刷新 latest.json + 更新清单'); }
   catch (e) { console.log(`⚠ fusion 刷新失败: ${e.message}`); degraded = true; }
 
   console.log(`✓ desktop release ${VERSION} 发布完成(${Object.keys(assets).join('+') || '无产物'})`);

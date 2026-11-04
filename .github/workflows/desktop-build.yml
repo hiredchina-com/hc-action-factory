@@ -9,11 +9,15 @@ name: desktop-build
 #   win         "true" 构建 Windows(默认 true)
 #
 # 产物:七牛 hiredchina-npm-mirror packages/huntermate-desktop-releases/
-#   v<version>/HunterMate-<version>-arm64.dmg
-#   v<version>/HunterMate Setup <version>.exe
+#   v<version>/HunterMate-<version>-<arch>.dmg           ← 人工安装面
+#   v<version>/HunterMate-<version>-mac-<arch>.zip       ← 自动更新载体(Squirrel.Mac)
+#   v<version>/HunterMate Setup <version>.exe            ← 人工安装面(win)
+#   v<version>/*.blockmap                                ← 差分更新前提
+#   latest.yml / latest-mac.yml                          ← electron-updater 清单(根目录)
 #   latest.json(下载页 /downloads 消费,带 cache-buster)
 #
-# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY、
+# RELEASES_PAT(跨仓发 GitHub Release)。
 # FID-121 教训在上传脚本内消化(curl + up 主机 fallback),job 不感知。
 
 on:
@@ -53,10 +57,14 @@ jobs:
           echo "✓ desktop-build params: version=$VERSION"
 
   build-mac:
-    name: mac dmg (arm64)
+    name: mac dmg+zip (${{ matrix.arch }})
     needs: detect
     if: ${{ needs.detect.outputs.want_mac == 'true' }}
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,25 +87,42 @@ jobs:
           npm run build:gate
       - name: Unit tests (发版门禁)
         run: npm test
+      # E2E 只跑 arm64(x64 在 arm64 runner 上无 Rosetta 保证;x64 链由打包门禁+真机 E2E 覆盖)
       - name: E2E tests (真实应用冷启动全链路;仅 mac——win runner GUI 会话不确定)
+        if: ${{ matrix.arch == 'arm64' }}
         run: npm run test:e2e
-      # 与本地 dist-mac.mjs 同一打包路径:dir 产物 → 产物门禁 → staging(含 beta 首次运行脚本) → UDZO dmg
-      # 2026-11-03 起不再用 electron-builder dmg target:UDZO 手动打包与本地同构,dmg 内容可完全控制
-      - name: Build dmg
+      # dist-mac.mjs:electron-builder zip target(产 .app+zip+app-update.yml)→ 门禁
+      # → staging(含 beta 首次运行脚本)→ UDZO dmg。zip=自动更新载体,dmg=人工安装面。
+      - name: Build dmg + update zip
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
-        run: node scripts/dist-mac.mjs
+        run: node scripts/dist-mac.mjs ${{ matrix.arch }}
+      - name: x64 产物门禁:原生模块必须带 darwin-x64 prebuild(arm64 runner 交叉打包不重建原生依赖)
+        if: ${{ matrix.arch == 'x64' }}
+        run: |
+          set -euo pipefail
+          for mod in resources/hm-server/node_modules/better-sqlite3 resources/runtime/node_modules/sherpa-onnx-darwin-x64; do
+            if [ -d "$mod" ]; then
+              find "$mod" -name "*darwin-x64*" | grep -q . || { echo "✗ $mod 缺 darwin-x64 prebuild"; exit 1; }
+            fi
+          done
+          echo "✓ x64 prebuild 门禁通过"
       - name: Locate + hash artifact
         id: art
         run: |
           set -euo pipefail
           DMG=$(ls dist/*.dmg | head -1)
+          ZIP=$(ls dist/*-mac-${{ matrix.arch }}.zip | head -1)
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "sha=$(shasum -a 256 "$DMG" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: mac-dmg
-          path: ${{ steps.art.outputs.dmg }}
+          name: mac-${{ matrix.arch }}
+          path: |
+            ${{ steps.art.outputs.dmg }}
+            ${{ steps.art.outputs.zip }}
+            ${{ steps.art.outputs.zip }}.blockmap
           if-no-files-found: error
 
   build-win:
@@ -149,7 +174,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: win-exe
-          path: ${{ steps.art.outputs.exe }}
+          path: |
+            ${{ steps.art.outputs.exe }}
+            ${{ steps.art.outputs.exe }}.blockmap
           if-no-files-found: error
 
   publish:
@@ -163,16 +190,40 @@ jobs:
           repository: hiredchina-com/hc-action-factory
           ref: main
           fetch-depth: "1"
+      # 检出私有仓只为 build-update-feed.mjs(纯 node,不 npm ci;blockmap 全由 build job 自带)
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+          path: app-src
       - uses: actions/download-artifact@v4
         with:
-          name: mac-dmg
-          path: artifacts/mac
+          name: mac-arm64
+          path: artifacts/mac-arm64
+        if: ${{ needs.build-mac.result == 'success' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-x64
+          path: artifacts/mac-x64
         if: ${{ needs.build-mac.result == 'success' }}
       - uses: actions/download-artifact@v4
         with:
           name: win-exe
           path: artifacts/win
         if: ${{ needs.build-win.result == 'success' }}
+      - name: 组装 electron-updater 清单(latest.yml / latest-mac.yml)
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARGS=(--version "$VERSION" --out "$GITHUB_WORKSPACE/feed")
+          [ -d artifacts/win ] && ARGS+=(--win-file "$(ls artifacts/win/*.exe | head -1)")
+          [ -d artifacts/mac-arm64 ] && ARGS+=(--mac-zip "$(ls artifacts/mac-arm64/*-mac-arm64.zip | head -1)" --mac-dmg "$(ls artifacts/mac-arm64/*.dmg | head -1)")
+          [ -d artifacts/mac-x64 ] && ARGS+=(--mac-zip "$(ls artifacts/mac-x64/*-mac-x64.zip | head -1)" --mac-dmg "$(ls artifacts/mac-x64/*.dmg | head -1)")
+          node app-src/scripts/build-update-feed.mjs "${ARGS[@]}"
+          ls -la feed/
       - name: Publish
         env:
           QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
@@ -185,21 +236,37 @@ jobs:
             echo "✗ 工厂仓未配置 QINIU keys,拒绝发布(产物已存 artifact 可补发)"; exit 1
           fi
           MAC_FILE=""; MAC_SHA=""
-          if [ -d artifacts/mac ]; then
-            MAC_FILE=$(ls artifacts/mac/*.dmg | head -1)
+          if [ -d artifacts/mac-arm64 ]; then
+            MAC_FILE=$(ls artifacts/mac-arm64/*.dmg | head -1)
             MAC_SHA=$(sha256sum "$MAC_FILE" | awk '{print $1}')
+          fi
+          MAC_X64_FILE=""; MAC_X64_SHA=""
+          if [ -d artifacts/mac-x64 ]; then
+            MAC_X64_FILE=$(ls artifacts/mac-x64/*.dmg | head -1)
+            MAC_X64_SHA=$(sha256sum "$MAC_X64_FILE" | awk '{print $1}')
           fi
           WIN_FILE=""; WIN_SHA=""
           if [ -d artifacts/win ]; then
             WIN_FILE=$(ls "artifacts/win"/*.exe | head -1)
             WIN_SHA=$(sha256sum "$WIN_FILE" | awk '{print $1}')
           fi
+          # 自动更新载体与清单:zip/blockmap → v<version>/;latest*.yml → 根(清单最后于所有二进制)
+          EXTRA=(); ROOTS=()
+          for d in artifacts/mac-arm64 artifacts/mac-x64 artifacts/win; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*.zip "$d"/*.blockmap; do
+              [ -e "$f" ] && EXTRA+=(--extra-file "$f")
+            done
+          done
+          [ -f feed/latest.yml ] && ROOTS+=(--root-file feed/latest.yml)
+          [ -f feed/latest-mac.yml ] && ROOTS+=(--root-file feed/latest-mac.yml)
           ARGS=(--version "$VERSION" --bucket hiredchina-npm-mirror \
             --key-prefix packages/huntermate-desktop-releases --keep 5 \
             --base-url https://npm.hiredchina.com --notes "$NOTES")
           [ -n "$MAC_FILE" ] && ARGS+=(--mac-file "$MAC_FILE" --mac-sha256 "$MAC_SHA")
+          [ -n "$MAC_X64_FILE" ] && ARGS+=(--mac-x64-file "$MAC_X64_FILE" --mac-x64-sha256 "$MAC_X64_SHA")
           [ -n "$WIN_FILE" ] && ARGS+=(--win-file "$WIN_FILE" --win-sha256 "$WIN_SHA")
-          node scripts/qiniu-desktop-release.mjs "${ARGS[@]}"
+          node scripts/qiniu-desktop-release.mjs "${ARGS[@]}" "${EXTRA[@]}" "${ROOTS[@]}"
 
   # GitHub Release 发布(公开仓 hiredchina-com/huntermate-desktop-releases):
   # 与七牛镜像并行、互不阻塞——GitHub runner → 七牛可能极慢(v0.2.1 实证 3h),
@@ -214,14 +281,34 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: mac-dmg
+          pattern: mac-*
           path: artifacts/mac
+          merge-multiple: true
         if: ${{ needs.build-mac.result == 'success' }}
       - uses: actions/download-artifact@v4
         with:
           name: win-exe
           path: artifacts/win
         if: ${{ needs.build-win.result == 'success' }}
+      # 检出私有仓只为 build-update-feed.mjs(纯 node,不 npm ci;blockmap 全由 build job 自带)
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.FACTORY_PAT }}
+          fetch-depth: "1"
+          path: app-src
+      - name: 组装 electron-updater 清单(latest.yml / latest-mac.yml)
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          # publish-github 独立组装(与 qiniu publish 并行互不阻塞),脚本口径与 publish job 一致
+          ARGS=(--version "$VERSION" --out "$GITHUB_WORKSPACE/feed")
+          [ -d artifacts/win ] && ARGS+=(--win-file "$(ls artifacts/win/*.exe | head -1)")
+          for z in artifacts/mac/*-mac-*.zip; do [ -e "$z" ] && ARGS+=(--mac-zip "$z"); done
+          for d in artifacts/mac/*.dmg; do [ -e "$d" ] && ARGS+=(--mac-dmg "$d"); done
+          node app-src/scripts/build-update-feed.mjs "${ARGS[@]}"
       - name: Publish to GitHub Release + 资产断言门
         env:
           GH_TOKEN: ${{ secrets.RELEASES_PAT }}
@@ -234,11 +321,25 @@ jobs:
             echo "✗ 工厂仓未配置 RELEASES_PAT(对 ${RELEASES_REPO} 有写权限),拒绝发布"; exit 1
           fi
           TAG="v${VERSION}"
-          MAC_SRC=""; WIN_SRC=""
-          [ -d artifacts/mac ] && MAC_SRC=$(ls artifacts/mac/*.dmg | head -1)
-          [ -d artifacts/win ] && WIN_SRC=$(ls "artifacts/win"/*.exe | head -1)
-          [ -n "$MAC_SRC" ] && cp "$MAC_SRC" "HunterMate-${VERSION}-mac-arm64.dmg"
-          [ -n "$WIN_SRC" ] && cp "$WIN_SRC" "HunterMate-Setup-${VERSION}-win-x64.exe"
+          mkdir -p release-assets
+          # 资产命名规范:HunterMate-<version>-mac-<arch>.dmg/zip、HunterMate-Setup-<version>-win-x64.exe
+          for d in artifacts/mac/*.dmg; do
+            [ -e "$d" ] || continue
+            ARCH=$(basename "$d" | sed -E 's/.*-([a-z0-9]+)\.dmg/\1/')
+            cp "$d" "release-assets/HunterMate-${VERSION}-mac-${ARCH}.dmg"
+          done
+          for z in artifacts/mac/*-mac-*.zip; do
+            [ -e "$z" ] || continue
+            cp "$z" "release-assets/$(basename "$z")"
+            [ -e "${z}.blockmap" ] && cp "${z}.blockmap" "release-assets/$(basename "$z").blockmap"
+          done
+          if [ -d artifacts/win ]; then
+            W=$(ls artifacts/win/*.exe | head -1)
+            cp "$W" "release-assets/HunterMate-Setup-${VERSION}-win-x64.exe"
+            [ -e "${W}.blockmap" ] && cp "${W}.blockmap" "release-assets/HunterMate-Setup-${VERSION}-win-x64.exe.blockmap"
+          fi
+          cp feed/latest.yml feed/latest-mac.yml release-assets/
+          cd release-assets
           # 校验清单(release body 展示 + 断言门基准)
           : > checksums.txt
           for f in HunterMate-*; do
@@ -264,6 +365,8 @@ jobs:
           if ! diff -u local.txt released.txt; then
             echo "✗ GitHub Release 资产对账失败"; exit 1
           fi
+          # 清单断言:update feed 文件必须成对存在(自动更新链完整性)
+          [ -f latest.yml ] && [ -f latest-mac.yml ] || { echo "✗ 缺 latest.yml/latest-mac.yml"; exit 1; }
           echo "::notice title=publish-github::${RELEASES_REPO} ${TAG} 已发布,资产对账通过"
 
   finalize:
