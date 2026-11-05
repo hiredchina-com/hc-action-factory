@@ -16,8 +16,9 @@ name: desktop-build
 #   latest.yml / latest-mac.yml                          ← electron-updater 清单(根目录)
 #   latest.json(下载页 /downloads 消费,带 cache-buster)
 #
-# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY、
-# RELEASES_PAT(跨仓发 GitHub Release)。
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
+# 2026-11-05 用户裁定:GitHub Release 腿已砍(自动更新链只吃七牛 generic provider,
+# RELEASES_PAT 不再补配),publish-github job 删除;七牛为唯一发布通道。
 # FID-121 教训在上传脚本内消化(curl + up 主机 fallback),job 不感知。
 
 on:
@@ -268,110 +269,13 @@ jobs:
           [ -n "$WIN_FILE" ] && ARGS+=(--win-file "$WIN_FILE" --win-sha256 "$WIN_SHA")
           node scripts/qiniu-desktop-release.mjs "${ARGS[@]}" "${EXTRA[@]}" "${ROOTS[@]}"
 
-  # GitHub Release 发布(公开仓 hiredchina-com/huntermate-desktop-releases):
-  # 与七牛镜像并行、互不阻塞——GitHub runner → 七牛可能极慢(v0.2.1 实证 3h),
-  # 而 GitHub Release 上传走 GitHub 自身网络。全自动:构建成功即发 latest。
-  # 令牌:需 secrets.RELEASES_PAT(对 huntermate-desktop-releases 有写权限的 PAT;
-  # GITHUB_TOKEN 不能跨仓)。未配置时本 job 显式失败,提醒补密钥,不静默跳过。
-  publish-github:
-    name: publish → GitHub Release
-    needs: [detect, build-mac, build-win]
-    if: ${{ always() && needs.detect.result == 'success' && (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') && (needs.build-win.result == 'success' || needs.build-win.result == 'skipped') && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: mac-*
-          path: artifacts/mac
-          merge-multiple: true
-        if: ${{ needs.build-mac.result == 'success' }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: win-exe
-          path: artifacts/win
-        if: ${{ needs.build-win.result == 'success' }}
-      # 检出私有仓只为 build-update-feed.mjs(纯 node,不 npm ci;blockmap 全由 build job 自带)
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.sha }}
-          token: ${{ secrets.FACTORY_PAT }}
-          fetch-depth: "1"
-          path: app-src
-      - name: 组装 electron-updater 清单(latest.yml / latest-mac.yml)
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          set -euo pipefail
-          # publish-github 独立组装(与 qiniu publish 并行互不阻塞),脚本口径与 publish job 一致
-          ARGS=(--version "$VERSION" --out "$GITHUB_WORKSPACE/feed")
-          [ -d artifacts/win ] && ARGS+=(--win-file "$(ls artifacts/win/*.exe | head -1)")
-          for z in artifacts/mac/*-mac-*.zip; do [ -e "$z" ] && ARGS+=(--mac-zip "$z"); done
-          for d in artifacts/mac/*.dmg; do [ -e "$d" ] && ARGS+=(--mac-dmg "$d"); done
-          node app-src/scripts/build-update-feed.mjs "${ARGS[@]}"
-      - name: Publish to GitHub Release + 资产断言门
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
-          RELEASES_REPO: hiredchina-com/huntermate-desktop-releases
-          VERSION: ${{ needs.detect.outputs.version }}
-          NOTES: ${{ needs.detect.outputs.notes }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "✗ 工厂仓未配置 RELEASES_PAT(对 ${RELEASES_REPO} 有写权限),拒绝发布"; exit 1
-          fi
-          TAG="v${VERSION}"
-          mkdir -p release-assets
-          # 资产命名规范:HunterMate-<version>-mac-<arch>.dmg/zip、HunterMate-Setup-<version>-win-x64.exe
-          for d in artifacts/mac/*.dmg; do
-            [ -e "$d" ] || continue
-            ARCH=$(basename "$d" | sed -E 's/.*-([a-z0-9]+)\.dmg/\1/')
-            cp "$d" "release-assets/HunterMate-${VERSION}-mac-${ARCH}.dmg"
-          done
-          for z in artifacts/mac/*-mac-*.zip; do
-            [ -e "$z" ] || continue
-            cp "$z" "release-assets/$(basename "$z")"
-            [ -e "${z}.blockmap" ] && cp "${z}.blockmap" "release-assets/$(basename "$z").blockmap"
-          done
-          if [ -d artifacts/win ]; then
-            W=$(ls artifacts/win/*.exe | head -1)
-            cp "$W" "release-assets/HunterMate-Setup-${VERSION}-win-x64.exe"
-            [ -e "${W}.blockmap" ] && cp "${W}.blockmap" "release-assets/HunterMate-Setup-${VERSION}-win-x64.exe.blockmap"
-          fi
-          cp feed/latest.yml feed/latest-mac.yml release-assets/
-          cd release-assets
-          # 校验清单(release body 展示 + 断言门基准)
-          : > checksums.txt
-          for f in HunterMate-*; do
-            echo "$(sha256sum "$f" | awk '{print $1}')  $f" >> checksums.txt
-          done
-          NOTES_FILE=$(mktemp)
-          printf '%s\n\n## 校验值(SHA-256)\n\n```\n' "$NOTES" > "$NOTES_FILE"
-          cat checksums.txt >> "$NOTES_FILE"
-          printf '```\n' >> "$NOTES_FILE"
-          # 已存在同 tag release 先删(重发场景;删不掉就失败,不叠资产)
-          gh release view "$TAG" --repo "$RELEASES_REPO" >/dev/null 2>&1 && \
-            gh release delete "$TAG" --repo "$RELEASES_REPO" --yes
-          ASSETS=(HunterMate-*)
-          gh release create "$TAG" --repo "$RELEASES_REPO" --title "$TAG" \
-            --notes-file "$NOTES_FILE" "${ASSETS[@]}"
-          # 断言门:release 资产数 + 逐字节大小必须与本地一致(sha256 已写入 body)
-          gh release view "$TAG" --repo "$RELEASES_REPO" --json assets \
-            --jq '.assets[] | "\(.size) \(.name)"' | sort > released.txt
-          for f in HunterMate-*; do
-            echo "$(stat -c %s "$f") $f" >> local.txt
-          done
-          sort -o local.txt local.txt
-          if ! diff -u local.txt released.txt; then
-            echo "✗ GitHub Release 资产对账失败"; exit 1
-          fi
-          # 清单断言:update feed 文件必须成对存在(自动更新链完整性)
-          [ -f latest.yml ] && [ -f latest-mac.yml ] || { echo "✗ 缺 latest.yml/latest-mac.yml"; exit 1; }
-          echo "::notice title=publish-github::${RELEASES_REPO} ${TAG} 已发布,资产对账通过"
+  # GitHub Release 腿:2026-11-05 用户裁定砍掉(自动更新链只吃七牛 generic
+  # provider;RELEASES_PAT 不再补配)。原 publish-github job 整段删除,
+  # finalize 不再引用;七牛 publish 是唯一发布门。
 
   finalize:
     name: finalize (status)
-    needs: [detect, build-mac, build-win, publish, publish-github]
+    needs: [detect, build-mac, build-win, publish]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -382,12 +286,11 @@ jobs:
           MAC: ${{ needs.build-mac.result }}
           WIN: ${{ needs.build-win.result }}
           PUBLISH: ${{ needs.publish.result }}
-          GITHUB_PUBLISH: ${{ needs.publish-github.result }}
         run: |
           ok_or_skip() { [[ "$1" == "success" || "$1" == "skipped" ]]; }
-          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" || "$GITHUB_PUBLISH" == "failure" ]]; then
+          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
-          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" || "$GITHUB_PUBLISH" == "success" ]]; then
+          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" ]]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=error" >> "$GITHUB_OUTPUT"
