@@ -126,8 +126,9 @@ async function withRetry(label, fn, attempts = 5) {
 }
 
 /** 单连接 form 上传(保底路径):v0.1.4/0.1.5 实证可用的最后手段;FID-137 节流下靠
- *  长超时 + 跨主机轮询赌快窗,慢但必达(<=314MB 实证;0.2.0 起 dmg ~650MB 超出
- *  节流下单连接 900s 押注上限,优先走 v1 分块)。maxTime 提到 5400s 兜底。 */
+ *  长超时 + 跨主机轮询赌快窗,慢但必达。maxTime 2400s(40min):单连接 650MB 在窗口期
+ *  ~2MB/s 只需 ~6min,40min 是灾备水位;原 5400s 与 v1/v2 预算叠加单轮次近 3h,
+ *  5 次重试远超 job 6h 硬杀(v0.3.2 二轮实证)。 */
 async function uploadFileMonolithic(key, filePath) {
   let last = null;
   for (const host of UPLOAD_HOSTS) {
@@ -138,7 +139,7 @@ async function uploadFileMonolithic(key, filePath) {
           '-F', `token=${uploadToken(key)}`,
           '-F', `key=${key}`,
           '-F', `file=@${filePath}`,
-        ], { maxTime: '5400', timeout: 5_460_000 }).trim();
+        ], { maxTime: '2400', timeout: 2_460_000 }).trim();
         return JSON.parse(out);
       }, 2);
     } catch (e) { last = e; console.log(`✗ ${host} 上传失败: ${e.message}`); }
@@ -152,7 +153,9 @@ async function uploadFileMonolithic(key, filePath) {
  *  QINIU_BLOCK_CONCURRENCY 默认 6,聚合 ~2MB/s 时 650MB ≈ 6min),块 ctx 全部落齐后
  *  mkfile 一次组装。任一 4MB 块失败只重传该块,不拖死整文件。 */
 const BLOCK_SIZE = 4 * 1024 * 1024;
-const BLOCK_CONCURRENCY = Math.max(1, parseInt(process.env.QINIU_BLOCK_CONCURRENCY || '6', 10) || 6);
+// 并发 6→12(2026-11-07 实证调整):七牛节流按单连接计,连接数=聚合带宽的线性杠杆;
+// v0.3.2 二轮 6 并发在窗口期实测 ~1.5-2MB/s,12 并发目标翻倍。可用 QINIU_BLOCK_CONCURRENCY 覆盖。
+const BLOCK_CONCURRENCY = Math.max(1, parseInt(process.env.QINIU_BLOCK_CONCURRENCY || '12', 10) || 12);
 const BLOCK_PART_MAX_TIME = '300';
 const BLOCK_PART_TIMEOUT = 330_000;
 
@@ -220,10 +223,20 @@ async function uploadFileV1Blocks(key, filePath) {
 }
 
 async function uploadFile(key, filePath) {
-  // 路径优先级(2026-11-07 v0.3.2 实证重排):v1 并发块(6 连接聚合,~2MB/s,650MB≈6min)
-  // → v2 分片(单连接顺序,节流下会磨死,仅作 v1 不可用时的兜底)→ 单连接 form(保底)。
+  // 断点续跑(v0.3.2 二轮实证):job 6h 硬杀后重跑,已完成的大文件整传浪费窗口期带宽
+  // (arm64 dmg 835MB 已落,重跑又传一遍 = 白烧 25min)。服务端同尺寸对象即跳过;
+  // 版本 key 不可变,同尺寸视为同一产物。stat 401/404(无管理权限/不存在)→ 正常上传。
+  try {
+    const st = qboxStat(key);
+    if (st.fsize === fs.statSync(filePath).size) {
+      console.log(`⏭ ${key} 已存在(尺寸一致 ${st.fsize}),跳过上传`);
+      return { skipped: true };
+    }
+  } catch { /* 不存在或无权限 → 正常上传 */ }
+  // 路径优先级(2026-11-07 v0.3.2 实证重排):v1 并发块(12 连接聚合,窗口期 ~2MB/s+,650MB≈数min)
+  // → v2 分片(单连接顺序,节流下会磨死,仅作兜底)→ 单连接 form(保底)。
   // 原顺序 v2 优先:v2 顺序片 5min/片 × 100 片 + 共用 1h token 过期 401 死循环,
-  // publish job 6h 硬杀(v0.3.2 发布灭因)。
+  // publish job 6h 硬杀(v0.3.2 首轮发布灭因)。
   try {
     return await uploadFileV1Blocks(key, filePath);
   } catch (e) {
@@ -328,6 +341,16 @@ function qboxList(prefix) {
   const out = execFileSync('curl', ['-fsS', '--max-time', '30', '-X', 'POST', `https://rs.qiniu.com${pathAndQuery}`,
     '-H', `Authorization: ${auth}`, '-H', 'Content-Type: application/x-www-form-urlencoded'],
     { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return JSON.parse(out);
+}
+
+/** QBox 管理接口:查对象元数据(断点续跑跳过判据);不存在时抛错(调用方按缺失处理) */
+function qboxStat(key) {
+  const encoded = b64u(Buffer.from(`${BUCKET}:${key}`, 'utf8'));
+  const pathAndQuery = `/stat/${encoded}`;
+  const auth = qboxSign('GET', pathAndQuery, 'rs.qiniu.com');
+  const out = execFileSync('curl', ['-fsS', '--max-time', '30', `https://rs.qiniu.com${pathAndQuery}`,
+    '-H', `Authorization: ${auth}`], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
   return JSON.parse(out);
 }
 
