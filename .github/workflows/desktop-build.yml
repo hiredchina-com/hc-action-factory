@@ -5,7 +5,7 @@ name: desktop-build
 # 触发:router 的 desktop-build 事件;params:
 #   version     语义化版本(必填,如 0.1.0;dispatcher 从 tag v* 剥前缀)
 #   notes       发行说明(可选)
-#   mac         "true" 构建 macOS(默认 true;macos-14 10x 计费,按需关)
+#   mac         "true" 构建 macOS(默认 true;macos-latest(arm64),x64 交叉构建)
 #   win         "true" 构建 Windows(默认 true)
 #
 # 产物:七牛 hiredchina-npm-mirror packages/huntermate-desktop-releases/
@@ -61,7 +61,9 @@ jobs:
     name: mac dmg+zip (${{ matrix.arch }})
     needs: detect
     if: ${{ needs.detect.outputs.want_mac == 'true' }}
-    runs-on: macos-14
+    # macos-14 镜像已下线(2026-11-07 实证:job 起 1 秒即被平台取消,11-04 还正常;
+    # 同仓 macos-latest 探针 11-06 正常)。macos-latest=arm64,x64 走交叉构建。
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
