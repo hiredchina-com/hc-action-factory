@@ -157,12 +157,14 @@ const BLOCK_PART_MAX_TIME = '300';
 const BLOCK_PART_TIMEOUT = 330_000;
 
 async function uploadFileV1Blocks(key, filePath) {
-  const token = uploadToken(key);
   const size = fs.statSync(filePath).size;
   const totalBlocks = Math.max(1, Math.ceil(size / BLOCK_SIZE));
   const ctxs = new Array(totalBlocks).fill(null);
   const fd = fs.openSync(filePath, 'r');
   const b64Key = b64u(Buffer.from(key, 'utf8'));
+  // 无进展兜底:整路径 40min 预算(650MB@6 并发聚合 ~2MB/s ≈ 6min,40min=容灾水位),
+  // 超时抛错移交 fallback,避免 v0.3.2 实证的单路径 6h 磨死整 job(平台 6h 硬杀)
+  const pathDeadline = Date.now() + 40 * 60 * 1000;
   try {
     for (let round = 1; round <= 3 && ctxs.some((c) => !c); round++) {
       let progressed = false;
@@ -171,6 +173,7 @@ async function uploadFileV1Blocks(key, filePath) {
           let next = 0;
           const worker = async () => {
             for (;;) {
+              if (Date.now() > pathDeadline) throw new Error('v1 分块 40min 预算耗尽');
               const idx = next++;
               if (idx >= totalBlocks) return;
               if (ctxs[idx]) continue;
@@ -181,9 +184,10 @@ async function uploadFileV1Blocks(key, filePath) {
               const tmp = path.join(os.tmpdir(), `qiniu-blk-${process.pid}-${idx}`);
               fs.writeFileSync(tmp, buf);
               try {
+                // token 每块现签:v0.3.2 实证整上传共用 1h token,超时后全部 401 死循环
                 const out = upCurl(host, [
                   '-X', 'POST', `https://${host}/mkblk/${len}`,
-                  '-H', `Authorization: UpToken ${token}`,
+                  '-H', `Authorization: UpToken ${uploadToken(key)}`,
                   '-H', 'Content-Type: application/octet-stream',
                   '--data-binary', `@${tmp}`,
                 ], { maxTime: BLOCK_PART_MAX_TIME, timeout: BLOCK_PART_TIMEOUT });
@@ -199,7 +203,7 @@ async function uploadFileV1Blocks(key, filePath) {
           if (ctxs.every(Boolean)) {
             const done = upCurl(host, [
               '-X', 'POST', `https://${host}/mkfile/${size}/key/${b64Key}`,
-              '-H', `Authorization: UpToken ${token}`,
+              '-H', `Authorization: UpToken ${uploadToken(key)}`,
               '-H', 'Content-Type: text/plain',
               '--data-binary', ctxs.join(','),
             ], { maxTime: '120', timeout: 130_000 });
@@ -216,22 +220,25 @@ async function uploadFileV1Blocks(key, filePath) {
 }
 
 async function uploadFile(key, filePath) {
-  try {
-    return await uploadFileMultipart(key, filePath);
-  } catch (e) {
-    console.log(`⚠ 分片 v2 不可用(${e.message}),改 v1 分块(mkblk/mkfile)`);
-  }
+  // 路径优先级(2026-11-07 v0.3.2 实证重排):v1 并发块(6 连接聚合,~2MB/s,650MB≈6min)
+  // → v2 分片(单连接顺序,节流下会磨死,仅作 v1 不可用时的兜底)→ 单连接 form(保底)。
+  // 原顺序 v2 优先:v2 顺序片 5min/片 × 100 片 + 共用 1h token 过期 401 死循环,
+  // publish job 6h 硬杀(v0.3.2 发布灭因)。
   try {
     return await uploadFileV1Blocks(key, filePath);
   } catch (e) {
-    console.log(`⚠ v1 分块失败(${e.message}),回退单连接 form 上传(慢但保底)`);
+    console.log(`⚠ v1 分块不可用(${e.message}),改分片 v2`);
+  }
+  try {
+    return await uploadFileMultipart(key, filePath);
+  } catch (e) {
+    console.log(`⚠ 分片 v2 不可用(${e.message}),回退单连接 form 上传(慢但保底)`);
     return uploadFileMonolithic(key, filePath);
   }
 }
 
 async function uploadFileMultipart(key, filePath) {
   const MULTI_PART_ROUNDS = 2;
-  const token = uploadToken(key);
   const size = fs.statSync(filePath).size;
   // 对象名编码两种候选(qiniu 文档/SDK 版本间不一致,社区实证并存):
   //   A) encodeURIComponent   B) URLSafeBase64(key)
@@ -245,6 +252,8 @@ async function uploadFileMultipart(key, filePath) {
   const etags = new Array(totalParts).fill(null);
   let uploadId = null;
   const fd = fs.openSync(filePath, 'r');
+  // 同 v1:40min 路径预算,防单路径磨死整 job(v0.3.2 实证)
+  const pathDeadline = Date.now() + 40 * 60 * 1000;
   try {
     // 多轮×多主机:同一 uploadId 跨主机续传(片已落服务器的跳过),吃满封禁抖动窗口
     for (let round = 1; round <= MULTI_PART_ROUNDS; round++) {
@@ -257,35 +266,46 @@ async function uploadFileMultipart(key, filePath) {
           const base = `https://${host}/buckets/${BUCKET}/objects/${encKey}/uploads`;
           try {
             if (!uploadId) {
-              uploadId = JSON.parse(upCurl(host, ['-X', 'POST', base, '-H', `Authorization: UpToken ${token}`])).uploadId;
+              // token 每次调用现签:共用 1h token 超时后全部 401 死循环(v0.3.2 实证)
+              uploadId = JSON.parse(upCurl(host, ['-X', 'POST', base, '-H', `Authorization: UpToken ${uploadToken(key)}`])).uploadId;
               encIdx = ei;
               console.log(`✓ init uploadId=${uploadId.slice(0, 12)}…(${totalParts} 片, 编码=${ei === 0 ? 'urlenc' : 'b64'})`);
             }
             for (let part = 1; part <= totalParts; part++) {
-            if (etags[part - 1]) continue;
-            const buf = Buffer.alloc(Math.min(PART_SIZE, size - (part - 1) * PART_SIZE));
-            fs.readSync(fd, buf, 0, buf.length, (part - 1) * PART_SIZE);
-            const tmp = path.join(os.tmpdir(), `qiniu-part-${process.pid}-${part}`);
-            fs.writeFileSync(tmp, buf);
-            try {
-              const etag = upCurl(host, [
-                '-X', 'PUT', `${base}/${uploadId}/${part}`,
-                '-H', `Authorization: UpToken ${token}`,
-                '-H', 'Content-Type: application/octet-stream',
-                '--data-binary', `@${tmp}`,
-              ]);
-              etags[part - 1] = JSON.parse(etag).etag;
-              progressed = true;
-              if (part % 5 === 0 || part === totalParts) console.log(`✓ part ${part}/${totalParts}`);
-            } catch (e) {
-              console.log(`⚠ part ${part}/${totalParts}@${host}: ${e.message}`);
-            } finally { fs.rmSync(tmp, { force: true }); }
-          }
+              if (Date.now() > pathDeadline) throw new Error('v2 分片 40min 预算耗尽');
+              if (etags[part - 1]) continue;
+              const buf = Buffer.alloc(Math.min(PART_SIZE, size - (part - 1) * PART_SIZE));
+              fs.readSync(fd, buf, 0, buf.length, (part - 1) * PART_SIZE);
+              const tmp = path.join(os.tmpdir(), `qiniu-part-${process.pid}-${part}`);
+              fs.writeFileSync(tmp, buf);
+              try {
+                // 单片 3 次重试,每次现签 token;节流窗口下单片超时是常态,不再等整轮
+                let etag = null;
+                for (let attempt = 1; attempt <= 3 && !etag; attempt++) {
+                  try {
+                    etag = JSON.parse(upCurl(host, [
+                      '-X', 'PUT', `${base}/${uploadId}/${part}`,
+                      '-H', `Authorization: UpToken ${uploadToken(key)}`,
+                      '-H', 'Content-Type: application/octet-stream',
+                      '--data-binary', `@${tmp}`,
+                    ])).etag;
+                  } catch (e) {
+                    console.log(`⚠ part ${part}/${totalParts}@${host} 第${attempt}/3 次: ${e.message}`);
+                  }
+                }
+                if (!etag) throw new Error(`part ${part} 3 次重试均失败`);
+                etags[part - 1] = etag;
+                progressed = true;
+                if (part % 5 === 0 || part === totalParts) console.log(`✓ part ${part}/${totalParts}`);
+              } catch (e) {
+                console.log(`⚠ part ${part}/${totalParts}@${host}: ${e.message}`);
+              } finally { fs.rmSync(tmp, { force: true }); }
+            }
           if (etags.every(Boolean)) {
             const body = JSON.stringify({ parts: etags.map((etag, i) => ({ partNumber: i + 1, etag })) });
             const done = upCurl(host, [
               '-X', 'POST', `${base}/${uploadId}/complete`,
-              '-H', `Authorization: UpToken ${token}`,
+              '-H', `Authorization: UpToken ${uploadToken(key)}`,
               '-H', 'Content-Type: application/json',
               '--data', body,
             ]);
