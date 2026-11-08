@@ -20,7 +20,7 @@
 //   { "platforms": { "<platformKey>": {
 //       "plugin": { "version": "0.3.2", "file": "/abs/plugin.tar.gz" },
 //       "driver": { "version": "0.43.2", "file": "/abs/driver-darwin-x64.tar.gz" } } } }
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -128,7 +128,7 @@ function semverDesc(a, b) {
   return 0;
 }
 
-const sha256 = (file) => execFileSync('sha256sum', [file], { encoding: 'utf-8' }).split(/\s+/)[0].toLowerCase();
+const sha256 = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 // ---------- main ----------
 (async () => {
