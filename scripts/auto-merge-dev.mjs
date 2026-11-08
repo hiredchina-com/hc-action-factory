@@ -59,6 +59,11 @@ const DEFAULT_REPOS = [
     remote: "git@github.com:hiredchina-com/job-pages.git",
     github: "hiredchina-com/job-pages",
   },
+  {
+    name: "huntermate-desktop",
+    remote: "git@github.com:hiredchina-com/huntermate-desktop.git",
+    github: "hiredchina-com/huntermate-desktop",
+  },
 ];
 
 const CACHE_ROOT =
