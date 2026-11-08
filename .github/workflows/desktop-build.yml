@@ -134,17 +134,25 @@ jobs:
         env:
           VERSION: ${{ needs.detect.outputs.version }}
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          # Sparkle 官方发布版(工具目录,含 generate_appcast/sign_update 通用二进制)。
+          # 2026-11-08 起不再依赖 huntermate-desktop 的 electron-sparkle-updater npm 包
+          # (其安装器已被客户端弃用,依赖随 b46ce53 清退);URL+sha256 双钉,防供应链漂移。
+          SPARKLE_TOOLS_URL: https://github.com/sparkle-project/Sparkle/releases/download/2.9.4/Sparkle-2.9.4.tar.xz
+          SPARKLE_TOOLS_SHA256: ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9
         run: |
           set -euo pipefail
-          [ -n "$SPARKLE_ED_PRIVATE_KEY" ] || { echo "✗ 工厂仓未配 SPARKLE_ED_PRIVATE_KEY,拒绝发布(mac Sparkle 链断)"; exit 1; }
+          [ -n "$SPARKLE_ED_PRIVATE_KEY" ] || { echo "✗ 工厂仓未配 SPARKLE_ED_PRIVATE_KEY,拒绝发布(mac 更新链断)"; exit 1; }
           ZIP="${{ steps.art.outputs.zip }}"
           ARCH="${{ matrix.arch }}"
           ARCDIR="$GITHUB_WORKSPACE/appcast"
           mkdir -p "$ARCDIR"
           cp "$ZIP" "$ARCDIR/"
-          # dist-mac 已跑 rebuild(vendor/bin 就位);stamp 命中毫秒级短路
-          bash node_modules/electron-sparkle-updater/native/scripts/fetch-sparkle.sh
-          BIN="node_modules/electron-sparkle-updater/native/vendor/bin/generate_appcast"
+          TOOLS="$RUNNER_TEMP/sparkle-tools"
+          mkdir -p "$TOOLS"
+          curl -fLsS --retry 3 "$SPARKLE_TOOLS_URL" -o "$TOOLS/tools.tar.xz"
+          printf '%s  %s\n' "$SPARKLE_TOOLS_SHA256" "$TOOLS/tools.tar.xz" | shasum -a 256 -c -
+          tar -xf "$TOOLS/tools.tar.xz" -C "$TOOLS" ./bin/generate_appcast
+          BIN="$TOOLS/bin/generate_appcast"
           BASE="https://npm.hiredchina.com/packages/huntermate-desktop-releases"
           echo "$SPARKLE_ED_PRIVATE_KEY" | "$BIN" --ed-key-file - "$ARCDIR" \
             --download-url-prefix "$BASE/v$VERSION/"
