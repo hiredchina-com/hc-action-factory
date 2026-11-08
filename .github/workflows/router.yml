@@ -22,6 +22,7 @@ on:
       - sync-deps
       - desktop-build
       - hmh-release
+      - cu-release
 
 jobs:
   guard:
@@ -209,6 +210,16 @@ jobs:
     needs: guard
     if: github.event.action == 'hmh-release'
     uses: ./.github/workflows/hmh-release.yml
+    secrets: inherit
+    with:
+      repository: ${{ needs.guard.outputs.repository }}
+      sha: ${{ needs.guard.outputs.sha }}
+      params_json: ${{ needs.guard.outputs.params_json }}
+
+  cu-release:
+    needs: guard
+    if: github.event.action == 'cu-release'
+    uses: ./.github/workflows/cu-release.yml
     secrets: inherit
     with:
       repository: ${{ needs.guard.outputs.repository }}

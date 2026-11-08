@@ -1,0 +1,169 @@
+name: cu-release
+
+# hmd(huntermate-desktop)电脑操控组件(computer-use)双组件发布。
+# hmd 侧 src/main/lib/computer-use.js 契约:
+#   <cdnBase>/packages/cu-releases/<platformKey>/{plugin,driver}-latest.json
+#     → { version, url, sha256 };tarball 根 = 组件根。
+#
+# 组件来源(全公开源,无需 FACTORY_PAT 检私有仓):
+#   plugin  dsh-computer-use(988hj7tczd-oss,MIT)GitHub tag 源码
+#           + peerDependencies/dsh.compatibility 宽容化补丁
+#           (hmd 内嵌 dsh 0.2.1-rc.2,上游 peerDep 上界 <0.2.0 会被硬禁用,
+#            补丁范围仅放宽下界,已在本机净室 e2e 实证加载无禁用)
+#   driver  trycua/cua 的 cua-driver-rs 原生引擎,4 平台 raw 资产
+#           (darwin tar.gz / windows zip,顶目录剥掉重打包为组件根布局)
+#
+# 触发:router 的 cu-release 事件;params:
+#   plugin_version  插件版本(必填,须为已存在 GitHub tag,如 0.3.2)
+#   driver_version  引擎版本(必填,须为已存在 cua-driver-rs  Release,如 0.43.2)
+#
+# 产物:七牛 hiredchina-npm-mirror packages/cu-releases/<platformKey>/
+#   v<version>/{plugin,driver}-<version>.tar.gz
+#   {plugin,driver}-latest.json(hmd fetchComponentLatest 契约)
+#   平台键:darwin-arm64 / darwin-x64 / win32-x64 / win32-arm64
+#
+# 需要工厂仓 Secrets:QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
+# dispatcher 自 9/25 死期间手动补发:
+#   gh api repos/hiredchina-com/hc-action-factory/dispatches \
+#     -f event_type=cu-release \
+#     -f 'client_payload[repository]=hiredchina-com/huntermate-desktop' \
+#     -f 'client_payload[sha]=<40 位 sha>' \
+#     -f 'client_payload[params][plugin_version]=0.3.2' \
+#     -f 'client_payload[params][driver_version]=0.43.2'
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      params_json:
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: pack + publish computer-use components
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiredchina-com/hc-action-factory
+          ref: main
+          fetch-depth: "1"
+
+      - name: Resolve versions + fetch upstream sources
+        id: src
+        env:
+          PARAMS: ${{ inputs.params_json }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PLUGIN_VERSION=$(jq -r '.plugin_version // ""' <<< "$PARAMS")
+          DRIVER_VERSION=$(jq -r '.driver_version // ""' <<< "$PARAMS")
+          [[ "$PLUGIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "✗ params.plugin_version 非法: '$PLUGIN_VERSION'"; exit 1; }
+          [[ "$DRIVER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "✗ params.driver_version 非法: '$DRIVER_VERSION'"; exit 1; }
+          echo "plugin_version=$PLUGIN_VERSION" >> "$GITHUB_OUTPUT"
+          echo "driver_version=$DRIVER_VERSION" >> "$GITHUB_OUTPUT"
+
+          WORK="$RUNNER_TEMP/cu-src"
+          mkdir -p "$WORK/driver"
+          cd "$WORK"
+
+          # ── driver:4 平台 raw 资产 + 官方 SHA256SUMS 校验 ──
+          gh release download "cua-driver-rs-v${DRIVER_VERSION}" --repo trycua/cua \
+            --pattern 'SHA256SUMS' \
+            --pattern "cua-driver-rs-${DRIVER_VERSION}-darwin-arm64.tar.gz" \
+            --pattern "cua-driver-rs-${DRIVER_VERSION}-darwin-x86_64.tar.gz" \
+            --pattern "cua-driver-rs-${DRIVER_VERSION}-windows-arm64.zip" \
+            --pattern "cua-driver-rs-${DRIVER_VERSION}-windows-x86_64.zip"
+          for f in cua-driver-rs-*.tar.gz cua-driver-rs-*.zip; do
+            grep -q " $(sha256sum "$f" | awk '{print $1}')" SHA256SUMS || { echo "✗ $f sha256 与官方 SHA256SUMS 不符"; exit 1; }
+            echo "✓ $f 官方校验通过"
+          done
+
+          # 剥顶目录重打包为组件根布局(hmd untar 后直接在组件根找二进制)
+          repack_tgz() {  # $1=asset $2=平台键 $3=根内必备条目
+            local pk="$2" need="$3" top
+            rm -rf "x-$pk" && mkdir "x-$pk"
+            tar -xzf "$1" -C "x-$pk"
+            top=$(find "x-$pk" -mindepth 1 -maxdepth 1 -type d | head -1)
+            [[ -n "$top" ]] || { echo "✗ $1 无顶目录"; exit 1; }
+            [[ -e "$top/$need" ]] || { echo "✗ $pk 缺根条目 $need"; exit 1; }
+            (cd "$top" && tar -czf "$WORK/driver/driver-$pk.tar.gz" .)
+            echo "✓ driver-$pk.tar.gz($(du -h "$WORK/driver/driver-$pk.tar.gz" | cut -f1))"
+          }
+          repack_zip() {  # $1=asset $2=平台键 $3=根内必备条目
+            local pk="$2" need="$3" top
+            rm -rf "x-$pk" && mkdir "x-$pk"
+            unzip -q "$1" -d "x-$pk"
+            top=$(find "x-$pk" -mindepth 1 -maxdepth 1 -type d | head -1)
+            [[ -n "$top" ]] || { echo "✗ $1 无顶目录"; exit 1; }
+            [[ -e "$top/$need" ]] || { echo "✗ $pk 缺根条目 $need"; exit 1; }
+            (cd "$top" && tar -czf "$WORK/driver/driver-$pk.tar.gz" .)
+            echo "✓ driver-$pk.tar.gz($(du -h "$WORK/driver/driver-$pk.tar.gz" | cut -f1))"
+          }
+          repack_tgz "cua-driver-rs-${DRIVER_VERSION}-darwin-arm64.tar.gz"  darwin-arm64 "cua-driver"
+          repack_tgz "cua-driver-rs-${DRIVER_VERSION}-darwin-x86_64.tar.gz" darwin-x64   "cua-driver"
+          repack_zip  "cua-driver-rs-${DRIVER_VERSION}-windows-arm64.zip"   win32-arm64  "cua-driver.exe"
+          repack_zip  "cua-driver-rs-${DRIVER_VERSION}-windows-x86_64.zip"  win32-x64    "cua-driver.exe"
+
+          # ── plugin:GitHub tag 源码 + 兼容补丁 ──
+          git clone --depth 1 --branch "v${PLUGIN_VERSION}" \
+            https://github.com/988hj7tczd-oss/dsh-computer-use "plugin-src"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const p = 'plugin-src/package.json';
+          const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+          // 上游 peerDep 上界 <0.2.0 会把 hmd 内嵌 dsh 0.2.1-rc.2 判不兼容硬禁用;
+          // 补丁只放宽下界(API 面已实测兼容,净室 e2e 无禁用错)。
+          d.peerDependencies = { '@deepseek-ai/dsh-tools': '>=0.1.2-rc.1', '@deepseek-ai/schemastery': '>=3.18.2' };
+          d.dsh = d.dsh || {};
+          d.dsh.compatibility = Object.assign({}, d.dsh.compatibility, { dsh: '>=0.1.2-rc.1' });
+          fs.writeFileSync(p, JSON.stringify(d, null, 2) + '\n');
+          console.log('✓ plugin package.json 兼容补丁已打');
+          NODE
+          (cd plugin-src && tar -czf "$WORK/plugin.tar.gz" --exclude=.git .)
+          echo "✓ plugin.tar.gz($(du -h "$WORK/plugin.tar.gz" | cut -f1))"
+
+          # ── 发布 manifest ──
+          node - "$WORK" "$PLUGIN_VERSION" "$DRIVER_VERSION" > "$WORK/manifest.json" <<'NODE'
+          const [work, pv, dv] = process.argv.slice(2);
+          const platforms = {};
+          for (const pk of ['darwin-arm64', 'darwin-x64', 'win32-x64', 'win32-arm64']) {
+            platforms[pk] = {
+              plugin: { version: pv, file: `${work}/plugin.tar.gz`,
+                notes: `988hj7tczd-oss/dsh-computer-use v${pv} + peerDep 宽容化补丁(工厂 cu-release 注入)` },
+              driver: { version: dv, file: `${work}/driver/driver-${pk}.tar.gz`,
+                notes: `trycua/cua cua-driver-rs v${dv} raw 资产重打包` },
+            };
+          }
+          console.log(JSON.stringify({ platforms }, null, 2));
+          NODE
+          echo "✓ manifest.json 就绪"
+
+      - name: Publish → qiniu CDN
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+        run: |
+          set -uo pipefail
+          if [ -z "${QINIU_ACCESS_KEY:-}" ] || [ -z "${QINIU_SECRET_KEY:-}" ]; then
+            echo "✗ 工厂仓未配置 QINIU keys,拒绝发布(产物见上方日志可补发)"; exit 1
+          fi
+          node scripts/qiniu-cu-release.mjs \
+            --manifest "$RUNNER_TEMP/cu-src/manifest.json" \
+            --bucket hiredchina-npm-mirror \
+            --key-prefix packages/cu-releases \
+            --keep 3 \
+            --base-url https://npm.hiredchina.com
+          rc=$?
+          # 退出码约定同 qiniu-hmh-release:0 全绿;2 有降级;1 硬失败。
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::cu-release 发布成功但有降级项(见上方 ⚠ 日志)"
+            exit 0
+          fi
+          exit "$rc"
