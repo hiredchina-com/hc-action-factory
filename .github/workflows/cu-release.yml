@@ -81,7 +81,8 @@ jobs:
             --pattern "cua-driver-rs-${DRIVER_VERSION}-windows-arm64.zip" \
             --pattern "cua-driver-rs-${DRIVER_VERSION}-windows-x86_64.zip"
           for f in cua-driver-rs-*.tar.gz cua-driver-rs-*.zip; do
-            grep -q " $(sha256sum "$f" | awk '{print $1}')" SHA256SUMS || { echo "✗ $f sha256 与官方 SHA256SUMS 不符"; exit 1; }
+            HASH=$(sha256sum "$f" | awk '{print $1}')
+            grep -q "^$HASH " SHA256SUMS || { echo "✗ $f sha256($HASH) 与官方 SHA256SUMS 不符"; exit 1; }
             echo "✓ $f 官方校验通过"
           done
 
