@@ -127,6 +127,34 @@ jobs:
             ${{ steps.art.outputs.zip }}
             ${{ steps.art.outputs.zip }}.blockmap
           if-no-files-found: error
+      # Sparkle appcast(2026-11 B 路线):未签名 mac 的静默更新源,客户端按
+      # appcast-<arch>.xml 直拉。每版本全量重建(allowDowngrade=false 口径:只升最新)。
+      # EdDSA 私钥 secret 缺配硬失败——宁不发版,不放行"永远走降级链"的断链产物。
+      - name: 生成 Sparkle appcast(mac 静默更新源)
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SPARKLE_ED_PRIVATE_KEY" ] || { echo "✗ 工厂仓未配 SPARKLE_ED_PRIVATE_KEY,拒绝发布(mac Sparkle 链断)"; exit 1; }
+          ZIP="${{ steps.art.outputs.zip }}"
+          ARCH="${{ matrix.arch }}"
+          ARCDIR="$GITHUB_WORKSPACE/appcast"
+          mkdir -p "$ARCDIR"
+          cp "$ZIP" "$ARCDIR/"
+          # dist-mac 已跑 rebuild(vendor/bin 就位);stamp 命中毫秒级短路
+          bash node_modules/electron-sparkle-updater/native/scripts/fetch-sparkle.sh
+          BIN="node_modules/electron-sparkle-updater/native/vendor/bin/generate_appcast"
+          BASE="https://npm.hiredchina.com/packages/huntermate-desktop-releases"
+          echo "$SPARKLE_ED_PRIVATE_KEY" | "$BIN" --ed-key-file - "$ARCDIR" \
+            --download-url-prefix "$BASE/v$VERSION/"
+          mv "$ARCDIR/appcast.xml" "$ARCDIR/appcast-$ARCH.xml"
+          ls -la "$ARCDIR"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appcast-${{ matrix.arch }}
+          path: appcast/appcast-${{ matrix.arch }}.xml
+          if-no-files-found: error
 
   build-win:
     name: win nsis (x64)
@@ -216,6 +244,16 @@ jobs:
           name: win-exe
           path: artifacts/win
         if: ${{ needs.build-win.result == 'success' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: appcast-arm64
+          path: feed/appcast-arm64
+        if: ${{ needs.build-mac.result == 'success' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: appcast-x64
+          path: feed/appcast-x64
+        if: ${{ needs.build-mac.result == 'success' }}
       - name: 组装 electron-updater 清单(latest.yml / latest-mac.yml)
         env:
           VERSION: ${{ needs.detect.outputs.version }}
@@ -263,6 +301,9 @@ jobs:
           done
           [ -f feed/latest.yml ] && ROOTS+=(--root-file feed/latest.yml)
           [ -f feed/latest-mac.yml ] && ROOTS+=(--root-file feed/latest-mac.yml)
+          # Sparkle appcast(2026-11 B 路线):根目录按文件名落 key(basename 即远端 key)
+          [ -f feed/appcast-arm64/appcast-arm64.xml ] && ROOTS+=(--root-file feed/appcast-arm64/appcast-arm64.xml)
+          [ -f feed/appcast-x64/appcast-x64.xml ] && ROOTS+=(--root-file feed/appcast-x64/appcast-x64.xml)
           ARGS=(--version "$VERSION" --bucket hiredchina-npm-mirror \
             --key-prefix packages/huntermate-desktop-releases --keep 5 \
             --base-url https://npm.hiredchina.com --notes "$NOTES")
