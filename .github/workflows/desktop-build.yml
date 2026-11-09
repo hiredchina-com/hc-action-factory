@@ -99,7 +99,14 @@ jobs:
       - name: Build dmg + update zip
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
-        run: node scripts/dist-mac.mjs ${{ matrix.arch }}
+          # 诊断(2026-11-09 arm64 dmg 静默缺失定障用,定位后摘除):electron-builder 全量 debug
+          DEBUG: electron-builder
+        run: |
+          node scripts/dist-mac.mjs ${{ matrix.arch }}
+          echo "=== dist 产物清单 ==="
+          ls -la dist/ | grep -E "dmg|zip" || true
+          echo "=== 磁盘余量 ==="
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" || true
       - name: x64 产物门禁:原生模块必须带 darwin-x64 prebuild(arm64 runner 交叉打包不重建原生依赖)
         if: ${{ matrix.arch == 'x64' }}
         run: |
@@ -196,7 +203,14 @@ jobs:
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
         shell: bash
-        run: npx electron-builder --win nsis --x64 --publish never
+        run: |
+          # 诊断(2026-11-09 win 构建静默退出定障用,定位后摘除)
+          echo "=== which/版本 ==="
+          which electron-builder || true
+          node node_modules/electron-builder/out/cli/cli.js --version || echo "DIRECT_CLI_VERSION_FAILED=$?"
+          npx --no-install electron-builder --version || echo "NPX_NOINSTALL_VERSION_FAILED=$?"
+          echo "=== 构建 ==="
+          node node_modules/electron-builder/out/cli/cli.js --win nsis --x64 --publish never
       - name: 打包产物门禁 (electron-builder 会静默丢 extraResources 源顶层 node_modules,v0.1.5 实证)
         shell: bash
         run: |
