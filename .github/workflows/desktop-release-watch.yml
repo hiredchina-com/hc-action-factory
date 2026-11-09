@@ -1,0 +1,45 @@
+name: desktop-release-watch
+
+# desktop-build 失败监控(2026-11-09 定案,补「失败躺一天无人知」缺口):
+#   workflow_run 监听 desktop-build 完成;失败时:
+#     1. 下载失败日志 grep 瞬态错误(超时/连接重置/5xx/限流)
+#     2. 瞬态 && run_attempt < 3 → gh run rerun --failed 自动重试,播报重试
+#     3. 非瞬态或重试耗尽(≥3)→ 企微报警(@人级,带 run 链接)
+# 约束:workflow 不能重跑自己(社区 #67654),故 watcher 独立 workflow;
+# 幂等:handoff/编排全链对同版本重入安全(覆盖同内容,sha256 校验兜底)。
+
+on:
+  workflow_run:
+    workflows: ["desktop-build"]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read
+
+jobs:
+  watch:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 判瞬态 → 重试或报警
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WEBHOOK: ${{ secrets.WECOM_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO=hiredchina-com/hc-action-factory
+          LOGS=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || true)
+          TRANSIENT=$(echo "$LOGS" | grep -ciE "ETIMEDOUT|ECONNRESET|502 Bad Gateway|503|rate limit|timed out|Operation timeout|Connection reset|Could not resolve|Temporary failure" || true)
+          if [ "$ATTEMPT" -lt 3 ] && [ "$TRANSIENT" -gt 0 ]; then
+            gh run rerun "$RUN_ID" --repo "$REPO" --failed
+            MSG="🔁 HunterMate Desktop 构建失败(瞬态,第 ${ATTEMPT}/3 次),已自动重试\nhttps://github.com/$REPO/actions/runs/$RUN_ID"
+          elif [ "$ATTEMPT" -lt 3 ]; then
+            MSG="❌ HunterMate Desktop 构建失败(非瞬态,不自动重试,第 ${ATTEMPT}/3 次)请人工介入\nhttps://github.com/$REPO/actions/runs/$RUN_ID"
+          else
+            MSG="🚨 HunterMate Desktop 构建失败(重试 ${ATTEMPT} 次耗尽)请立即人工介入\nhttps://github.com/$REPO/actions/runs/$RUN_ID"
+          fi
+          curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' "$WEBHOOK" \
+            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"$MSG\"}}" || true

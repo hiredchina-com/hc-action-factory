@@ -16,10 +16,13 @@ name: desktop-build
 #   latest.yml / latest-mac.yml                          ← electron-updater 清单(根目录)
 #   latest.json(下载页 /downloads 消费,带 cache-buster)
 #
-# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、QINIU_ACCESS_KEY/QINIU_SECRET_KEY。
-# 2026-11-05 用户裁定:GitHub Release 腿已砍(自动更新链只吃七牛 generic provider,
-# RELEASES_PAT 不再补配),publish-github job 删除;七牛为唯一发布通道。
-# FID-121 教训在上传脚本内消化(curl + up 主机 fallback),job 不感知。
+# 发布架构(2026-11-09 用户裁定):runner 永不直传七牛(FID-121 上传域 IP 级
+# 封禁,v0.3.4 三次实证;runner→jp 隧道 ~40KB/s 亦不可用)。本 workflow 只构建+
+# 存工件,handoff 腿 ssh 触发 jp 服务器自治发布(分段拉工件→sha256→七牛→
+# CDN 重下校验→下载页读回→企微播报,/opt/hmd-desktop-release/publish-orchestrate.sh)。
+# 失败监控:desktop-release-watch.yml(workflow_run 瞬态重试+播报)。
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、JP_DEPLOY_SSH_KEY/JP_SERVER_HOST_KEY
+# (ssh 通道,同 docker-acr-deploy)、WECOM_WEBHOOK_URL(finalize 播报)。
 
 on:
   workflow_call:
@@ -220,115 +223,67 @@ jobs:
             ${{ steps.art.outputs.exe }}.blockmap
           if-no-files-found: error
 
-  publish:
-    name: publish → qiniu CDN
+  # 七牛上传腿已砍(见文件头)。handoff = 本 pipeline 的发布触发门:
+  # ssh 通道(cloudflared,同 docker-acr-deploy)调 jp 服务器自治发布编排,
+  # 同步等待其完成(0 全绿 / 非 0 失败),60 分钟防 stall 磨死。
+  handoff:
+    name: handoff → jp 服务器自治发布
     needs: [detect, build-mac, build-win]
     if: ${{ always() && needs.detect.result == 'success' && (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') && (needs.build-win.result == 'success' || needs.build-win.result == 'skipped') && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: hiredchina-com/hc-action-factory
-          ref: main
-          fetch-depth: "1"
-      # 检出私有仓只为 build-update-feed.mjs(纯 node,不 npm ci;blockmap 全由 build job 自带)
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.sha }}
-          token: ${{ secrets.FACTORY_PAT }}
-          fetch-depth: "1"
-          path: app-src
-      - uses: actions/download-artifact@v4
-        with:
-          name: mac-arm64
-          path: artifacts/mac-arm64
-        if: ${{ needs.build-mac.result == 'success' }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: mac-x64
-          path: artifacts/mac-x64
-        if: ${{ needs.build-mac.result == 'success' }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: win-exe
-          path: artifacts/win
-        if: ${{ needs.build-win.result == 'success' }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: appcast-arm64
-          path: feed/appcast-arm64
-        if: ${{ needs.build-mac.result == 'success' }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: appcast-x64
-          path: feed/appcast-x64
-        if: ${{ needs.build-mac.result == 'success' }}
-      - name: 组装 electron-updater 清单(latest.yml / latest-mac.yml)
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
+      - name: ssh 通道(cloudflared + host key pin,同 docker-acr-deploy 口径)
         run: |
           set -euo pipefail
-          ARGS=(--version "$VERSION" --out "$GITHUB_WORKSPACE/feed")
-          [ -d artifacts/win ] && ARGS+=(--win-file "$(ls artifacts/win/*.exe | head -1)")
-          [ -d artifacts/mac-arm64 ] && ARGS+=(--mac-zip "$(ls artifacts/mac-arm64/*-mac-arm64.zip | head -1)" --mac-dmg "$(ls artifacts/mac-arm64/*.dmg | head -1)")
-          [ -d artifacts/mac-x64 ] && ARGS+=(--mac-zip "$(ls artifacts/mac-x64/*-mac-x64.zip | head -1)" --mac-dmg "$(ls artifacts/mac-x64/*.dmg | head -1)")
-          node app-src/scripts/build-update-feed.mjs "${ARGS[@]}"
-          ls -la feed/
-      - name: Publish
+          sudo curl -sL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          sudo chmod +x /usr/local/bin/cloudflared
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.JP_DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.JP_SERVER_HOST_KEY }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host jp-ssh.hiredchina.com
+            User deployer
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
+            ServerAliveInterval 30
+            ServerAliveCountMax 3
+          EOF
+          chmod 600 ~/.ssh/config
+      # 挂断免疫(2026-11-10 实测定案):cloudflared 隧道会中途断 ssh(单次 4 分钟
+      # 即遇 "closed by remote host",60 分钟长会话必死)。编排以 setsid 脱离会话
+      # 后台跑,日志+rc 落盘;本步每分钟新连轮询,断连重试到 55 分钟为止。
+      - name: 触发 jp 发布编排(脱离会话 + 轮询收成)
         env:
-          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
-          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
           VERSION: ${{ needs.detect.outputs.version }}
           NOTES: ${{ needs.detect.outputs.notes }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          set -uo pipefail
-          if [ -z "${QINIU_ACCESS_KEY:-}" ] || [ -z "${QINIU_SECRET_KEY:-}" ]; then
-            echo "✗ 工厂仓未配置 QINIU keys,拒绝发布(产物已存 artifact 可补发)"; exit 1
-          fi
-          MAC_FILE=""; MAC_SHA=""
-          if [ -d artifacts/mac-arm64 ]; then
-            MAC_FILE=$(ls artifacts/mac-arm64/*.dmg | head -1)
-            MAC_SHA=$(sha256sum "$MAC_FILE" | awk '{print $1}')
-          fi
-          MAC_X64_FILE=""; MAC_X64_SHA=""
-          if [ -d artifacts/mac-x64 ]; then
-            MAC_X64_FILE=$(ls artifacts/mac-x64/*.dmg | head -1)
-            MAC_X64_SHA=$(sha256sum "$MAC_X64_FILE" | awk '{print $1}')
-          fi
-          WIN_FILE=""; WIN_SHA=""
-          if [ -d artifacts/win ]; then
-            WIN_FILE=$(ls "artifacts/win"/*.exe | head -1)
-            WIN_SHA=$(sha256sum "$WIN_FILE" | awk '{print $1}')
-          fi
-          # 自动更新载体与清单:zip/blockmap → v<version>/;latest*.yml → 根(清单最后于所有二进制)
-          EXTRA=(); ROOTS=()
-          for d in artifacts/mac-arm64 artifacts/mac-x64 artifacts/win; do
-            [ -d "$d" ] || continue
-            for f in "$d"/*.zip "$d"/*.blockmap; do
-              [ -e "$f" ] && EXTRA+=(--extra-file "$f")
-            done
+          set -euo pipefail
+          NOTES_B64=$(printf '%s' "$NOTES" | base64 -w0)
+          TS=$(date +%s)
+          LOG=/tmp/hmd-publish-$TS.log
+          MARK=/tmp/hmd-publish-$TS.rc
+          ssh jp-ssh.hiredchina.com \
+            "setsid nohup bash -c 'bash /opt/hmd-desktop-release/publish-orchestrate.sh --version \"$VERSION\" --run-id \"$RUN_ID\" --notes-b64 \"$NOTES_B64\" >$LOG 2>&1; echo \$? > $MARK' </dev/null >/dev/null 2>&1 &"
+          RC=""
+          for i in $(seq 1 55); do
+            sleep 60
+            RC=$(ssh -o ConnectTimeout=15 jp-ssh.hiredchina.com "cat $MARK 2>/dev/null" 2>/dev/null || true)
+            [ -n "$RC" ] && break
+            echo "… 等待 jp 发布完成 (${i}/55 min)"
           done
-          [ -f feed/latest.yml ] && ROOTS+=(--root-file feed/latest.yml)
-          [ -f feed/latest-mac.yml ] && ROOTS+=(--root-file feed/latest-mac.yml)
-          # Sparkle appcast(2026-11 B 路线):根目录按文件名落 key(basename 即远端 key)
-          [ -f feed/appcast-arm64/appcast-arm64.xml ] && ROOTS+=(--root-file feed/appcast-arm64/appcast-arm64.xml)
-          [ -f feed/appcast-x64/appcast-x64.xml ] && ROOTS+=(--root-file feed/appcast-x64/appcast-x64.xml)
-          ARGS=(--version "$VERSION" --bucket hiredchina-npm-mirror \
-            --key-prefix packages/huntermate-desktop-releases --keep 5 \
-            --base-url https://npm.hiredchina.com --notes "$NOTES")
-          [ -n "$MAC_FILE" ] && ARGS+=(--mac-file "$MAC_FILE" --mac-sha256 "$MAC_SHA")
-          [ -n "$MAC_X64_FILE" ] && ARGS+=(--mac-x64-file "$MAC_X64_FILE" --mac-x64-sha256 "$MAC_X64_SHA")
-          [ -n "$WIN_FILE" ] && ARGS+=(--win-file "$WIN_FILE" --win-sha256 "$WIN_SHA")
-          node scripts/qiniu-desktop-release.mjs "${ARGS[@]}" "${EXTRA[@]}" "${ROOTS[@]}"
-
-  # GitHub Release 腿:2026-11-05 用户裁定砍掉(自动更新链只吃七牛 generic
-  # provider;RELEASES_PAT 不再补配)。原 publish-github job 整段删除,
-  # finalize 不再引用;七牛 publish 是唯一发布门。
+          ssh -o ConnectTimeout=15 jp-ssh.hiredchina.com "tail -60 $LOG" 2>/dev/null || true
+          if [ -z "$RC" ]; then echo "✗ 轮询超时(55min),编排可能仍在跑,人工查 $LOG"; exit 1; fi
+          [ "$RC" = "0" ] && echo "✅ jp 发布编排全绿" || { echo "✗ jp 发布编排退出码 $RC"; exit "$RC"; }
 
   finalize:
-    name: finalize (status)
-    needs: [detect, build-mac, build-win, publish]
+    name: finalize (status + 播报)
+    needs: [detect, build-mac, build-win, handoff]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -338,12 +293,12 @@ jobs:
           DETECT: ${{ needs.detect.result }}
           MAC: ${{ needs.build-mac.result }}
           WIN: ${{ needs.build-win.result }}
-          PUBLISH: ${{ needs.publish.result }}
+          HANDOFF: ${{ needs.handoff.result }}
         run: |
           ok_or_skip() { [[ "$1" == "success" || "$1" == "skipped" ]]; }
-          if [[ "$DETECT" == "failure" || "$PUBLISH" == "failure" ]]; then
+          if [[ "$DETECT" == "failure" || "$HANDOFF" == "failure" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
-          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$PUBLISH" == "success" ]]; then
+          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$HANDOFF" == "success" ]]; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=error" >> "$GITHUB_OUTPUT"
@@ -354,8 +309,21 @@ jobs:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           if [ "$STATE" = "success" ]; then
-            echo "::notice title=desktop-build::HunterMate Desktop v${VERSION} 已发布 → https://npm.hiredchina.com/packages/huntermate-desktop-releases/latest.json"
+            echo "::notice title=desktop-build::HunterMate Desktop v${VERSION} 构建+交接完成,发布以 jp 播报为准"
           else
             echo "::error title=desktop-build::state=${STATE} version=${VERSION}"
             exit 1
           fi
+      # 失败必响(2026-11-09 定案:发布失败躺一天无人知是事故级缺口):
+      # 构建/交接失败即推企微,带 run 链接。发布本身的成败播报由 jp 编排负责。
+      - name: 企微播报(失败即推)
+        if: always() && steps.state.outputs.state != 'success'
+        env:
+          STATE: ${{ steps.state.outputs.state }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          RUN_URL: https://github.com/hiredchina-com/hc-action-factory/actions/runs/${{ github.run_id }}
+          WEBHOOK: ${{ secrets.WECOM_WEBHOOK_URL }}
+        run: |
+          MSG="❌ HunterMate Desktop v${VERSION} 构建/交接失败(state=${STATE})\n${RUN_URL}"
+          curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' "$WEBHOOK" \
+            -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"$MSG\"}}" || true
