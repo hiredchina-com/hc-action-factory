@@ -66,6 +66,10 @@ jobs:
       - name: Checkout factory repo (local action dependency)
         uses: actions/checkout@v4
       - uses: ./.github/actions/report-status
+        # 2026-11-10 用户裁定:状态回报是装饰性步骤(给 PR/分支保护看),PAT 失效/目标仓
+        # 抖动一律只告警不阻断——部署成败由 build-push-deploy 与 health gate 决定,
+        # 绝不能再出现「回报状态挂掉 → 22s 速败 → 发布发半天」。
+        continue-on-error: true
         with:
           token: ${{ secrets.FACTORY_PAT }}
           repository: ${{ inputs.repository }}
@@ -75,6 +79,7 @@ jobs:
           description: "deploy started"
       - name: Notify start
         if: ${{ fromJSON(inputs.params_json).notify.start != false }}
+        continue-on-error: true
         uses: ./.github/actions/wecom-notify
         with:
           webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
@@ -272,6 +277,8 @@ jobs:
           esac
 
       - uses: ./.github/actions/report-status
+        # 同 begin:状态回报失败不翻转部署结论(见 begin 步骤注释)。
+        continue-on-error: true
         with:
           token: ${{ secrets.FACTORY_PAT }}
           repository: ${{ inputs.repository }}
@@ -282,6 +289,7 @@ jobs:
 
       - name: Notify finish
         if: ${{ fromJSON(inputs.params_json).notify.finish != 'never' && (fromJSON(inputs.params_json).notify.finish == 'always' || needs.build-push-deploy.result == 'failure') }}
+        continue-on-error: true
         uses: ./.github/actions/wecom-notify
         with:
           webhook_url: ${{ secrets.WECOM_WEBHOOK_URL }}
