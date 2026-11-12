@@ -85,6 +85,9 @@ jobs:
       - name: Prepare deps + assets + gate
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          # 交叉打包目标 arch:arm64 runner 产 x64 时,prepare-runtime 按此 arch 解析
+          # 平台 optionalDependencies(v0.3.6 实证:缺此标志装成 darwin-arm64,Intel 机 dsh 启动即死)
+          HMD_TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           npm ci
@@ -107,12 +110,22 @@ jobs:
         if: ${{ matrix.arch == 'x64' }}
         run: |
           set -euo pipefail
-          for mod in resources/hm-server/node_modules/better-sqlite3 resources/runtime/node_modules/sherpa-onnx-darwin-x64; do
-            if [ -d "$mod" ]; then
-              find "$mod" -name "*darwin-x64*" | grep -q . || { echo "✗ $mod 缺 darwin-x64 prebuild"; exit 1; }
-            fi
+          # 反向断言(v0.3.6 事故教训):交叉产物严禁混入宿主机(arm64)原生包。
+          # 旧门禁用 `[ -d mod ]` 前置判断,目录缺失时静默跳过——arm64 包顶替时恰为缺失,门禁空转。
+          if find resources/runtime/node_modules resources/hm-server/node_modules -maxdepth 1 -name '*-darwin-arm64' 2>/dev/null | grep -q .; then
+            echo "✗ x64 产物混入 darwin-arm64 原生包(交叉打包按宿主机 arch 装依赖)"
+            find resources/runtime/node_modules resources/hm-server/node_modules -maxdepth 1 -name '*-darwin-arm64'
+            exit 1
+          fi
+          # 正向断言:启动链关键原生包必须就位(存在性硬校验,不许跳过)
+          for mod in \
+            resources/runtime/node_modules/node-addon-require-builtin-darwin-x64 \
+            resources/runtime/node_modules/sherpa-onnx-darwin-x64; do
+            [ -d "$mod" ] || { echo "✗ 缺 $mod"; exit 1; }
           done
-          echo "✓ x64 prebuild 门禁通过"
+          find resources/hm-server/node_modules/better-sqlite3 -name '*darwin-x64*' | grep -q . \
+            || { echo "✗ better-sqlite3 缺 darwin-x64 prebuild"; exit 1; }
+          echo "✓ x64 prebuild 门禁通过(无 arm64 残留,关键原生包就位)"
       - name: Locate + hash artifact
         id: art
         run: |
