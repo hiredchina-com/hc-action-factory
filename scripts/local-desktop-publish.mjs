@@ -395,7 +395,8 @@ function liveVersion() {
 // 故只看构建腿 job 成败 + 工件齐全 + 版本未在线,三重护栏,不依赖 run conclusion。
 function runHasDesktopBuildJobs(runId) {
   const jobs = ghJson(`actions/runs/${runId}/jobs?per_page=50`).jobs;
-  const legs = jobs.filter((j) => /^(mac dmg\+zip|win nsis)/.test(j.name));
+  // job 名带 "desktop-build / " 前缀(workflow_call 归属),匹配核心名即可
+  const legs = jobs.filter((j) => /mac dmg\+zip|win nsis/.test(j.name));
   if (legs.length === 0) return null; // 非 desktop-build 触发的 router run
   const ok = legs.filter((j) => j.conclusion === 'success').length;
   return { legs: legs.length, ok };
@@ -417,7 +418,7 @@ async function watch() {
       for (const r of runs) {
         const legs = runHasDesktopBuildJobs(r.id);
         if (!legs) { state.handled[r.id] = { skipped: 'non-desktop' }; saveState(state); continue; }
-        if (legs.ok === 0) continue;               // 构建腿全灭,等 watcher/rerun 救活再说
+        if (legs.ok !== legs.legs) continue;         // 构建腿未全绿,等 release-watch 重试救活
         const live = liveVersion();
         try {
           const res = await publishOne(r.id, '', true);
