@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- hmd-local-publish-watch.plist — HunterMate 桌面版本地发布 watcher(launchd 常驻)
+     安装(一次性):
+       cp scripts/hmd-local-publish-watch.plist ~/Library/LaunchAgents/com.hiredchina.hmd-local-publish-watch.plist
+       launchctl load ~/Library/LaunchAgents/com.hiredchina.hmd-local-publish-watch.plist
+     卸载:launchctl unload ~/Library/LaunchAgents/com.hiredchina.hmd-local-publish-watch.plist
+     日志:~/Library/Logs/hmd-local-publish-watch.{out,err}.log
+     钥匙:工厂 worktree .env.local(0600),脚本自行加载,勿把钥匙写进本 plist。
+     PATH 须含 gh(本机 GitHub CLI 登录态=工件拉取凭证,gh 重登/吊销须重启本服务)。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hiredchina.hmd-local-publish-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>FACTORY_WORKTREE/scripts/local-desktop-publish.mjs</string>
+    <string>--watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/thomas/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/thomas/Library/Logs/hmd-local-publish-watch.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/thomas/Library/Logs/hmd-local-publish-watch.err.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

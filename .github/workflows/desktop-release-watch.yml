@@ -6,7 +6,8 @@ name: desktop-release-watch
 #     2. 瞬态 && run_attempt < 3 → gh run rerun --failed 自动重试,播报重试
 #     3. 非瞬态或重试耗尽(≥3)→ 企微报警(@人级,带 run 链接)
 # 约束:workflow 不能重跑自己(社区 #67654),故 watcher 独立 workflow;
-# 幂等:handoff/编排全链对同版本重入安全(覆盖同内容,sha256 校验兜底)。
+# 幂等:构建腿对同版本重入安全。发布不再经 CI(2026-11-15 handoff 腿已砍,
+# 改本机 scripts/local-desktop-publish.mjs --watch 常驻 watcher 自动发布)。
 
 on:
   workflow_run:

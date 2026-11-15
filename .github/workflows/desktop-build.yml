@@ -16,13 +16,15 @@ name: desktop-build
 #   latest.yml / latest-mac.yml                          ← electron-updater 清单(根目录)
 #   latest.json(下载页 /downloads 消费,带 cache-buster)
 #
-# 发布架构(2026-11-09 用户裁定):runner 永不直传七牛(FID-121 上传域 IP 级
-# 封禁,v0.3.4 三次实证;runner→jp 隧道 ~40KB/s 亦不可用)。本 workflow 只构建+
-# 存工件,handoff 腿 ssh 触发 jp 服务器自治发布(分段拉工件→sha256→七牛→
-# CDN 重下校验→下载页读回→企微播报,/opt/hmd-desktop-release/publish-orchestrate.sh)。
+# 发布架构(2026-11-15 用户裁定,Task#23):handoff 腿(jp 服务器 ssh 编排)已砍——
+# 其 GitHub 工件拉取 2026-11-14 起稳定死亡(8 分段全部恰死 13056 字节,3 试 3 败)。
+# 本 workflow 只构建+存工件;发布走本机直传(已实战 v0.3.11,8 分钟 1.7GB 全绿):
+#   手动:node scripts/local-desktop-publish.mjs --run <run-id>
+#   自动:本机 launchd 常驻 watcher(--watch,plist 见 scripts/hmd-local-publish-watch.plist)
+# runner 永不直传七牛(FID-121 封禁三跑实证)、jp↔GitHub 大工件限速不可用(实测)。
 # 失败监控:desktop-release-watch.yml(workflow_run 瞬态重试+播报)。
-# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、JP_DEPLOY_SSH_KEY/JP_SERVER_HOST_KEY
-# (ssh 通道,同 docker-acr-deploy)、WECOM_WEBHOOK_URL(finalize 播报)。
+# 需要工厂仓 Secrets:FACTORY_PAT(检出私有仓)、WECOM_WEBHOOK_URL(finalize 播报)。
+# (JP_DEPLOY_SSH_KEY 仅 docker-acr-deploy 等部署链仍在用)
 
 on:
   workflow_call:
@@ -236,67 +238,13 @@ jobs:
             ${{ steps.art.outputs.exe }}.blockmap
           if-no-files-found: error
 
-  # 七牛上传腿已砍(见文件头)。handoff = 本 pipeline 的发布触发门:
-  # ssh 通道(cloudflared,同 docker-acr-deploy)调 jp 服务器自治发布编排,
-  # 同步等待其完成(0 全绿 / 非 0 失败),60 分钟防 stall 磨死。
-  handoff:
-    name: handoff → jp 服务器自治发布
-    needs: [detect, build-mac, build-win]
-    if: ${{ always() && needs.detect.result == 'success' && (needs.build-mac.result == 'success' || needs.build-mac.result == 'skipped') && (needs.build-win.result == 'success' || needs.build-win.result == 'skipped') && (needs.build-mac.result == 'success' || needs.build-win.result == 'success') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: ssh 通道(cloudflared + host key pin,同 docker-acr-deploy 口径)
-        run: |
-          set -euo pipefail
-          sudo curl -sL -o /usr/local/bin/cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-          sudo chmod +x /usr/local/bin/cloudflared
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.JP_DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "${{ secrets.JP_SERVER_HOST_KEY }}" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          cat > ~/.ssh/config <<EOF
-          Host jp-ssh.hiredchina.com
-            User deployer
-            IdentityFile ~/.ssh/id_ed25519
-            IdentitiesOnly yes
-            ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
-            ServerAliveInterval 30
-            ServerAliveCountMax 3
-          EOF
-          chmod 600 ~/.ssh/config
-      # 挂断免疫(2026-11-10 实测定案):cloudflared 隧道会中途断 ssh(单次 4 分钟
-      # 即遇 "closed by remote host",60 分钟长会话必死)。编排以 setsid 脱离会话
-      # 后台跑,日志+rc 落盘;本步每分钟新连轮询,断连重试到 55 分钟为止。
-      - name: 触发 jp 发布编排(脱离会话 + 轮询收成)
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-          NOTES: ${{ needs.detect.outputs.notes }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          NOTES_B64=$(printf '%s' "$NOTES" | base64 -w0)
-          TS=$(date +%s)
-          LOG=/tmp/hmd-publish-$TS.log
-          MARK=/tmp/hmd-publish-$TS.rc
-          ssh jp-ssh.hiredchina.com \
-            "setsid nohup bash -c 'bash /opt/hmd-desktop-release/publish-orchestrate.sh --version \"$VERSION\" --run-id \"$RUN_ID\" --notes-b64 \"$NOTES_B64\" >$LOG 2>&1; echo \$? > $MARK' </dev/null >/dev/null 2>&1 &"
-          RC=""
-          for i in $(seq 1 55); do
-            sleep 60
-            RC=$(ssh -o ConnectTimeout=15 jp-ssh.hiredchina.com "cat $MARK 2>/dev/null" 2>/dev/null || true)
-            [ -n "$RC" ] && break
-            echo "… 等待 jp 发布完成 (${i}/55 min)"
-          done
-          ssh -o ConnectTimeout=15 jp-ssh.hiredchina.com "tail -60 $LOG" 2>/dev/null || true
-          if [ -z "$RC" ]; then echo "✗ 轮询超时(55min),编排可能仍在跑,人工查 $LOG"; exit 1; fi
-          [ "$RC" = "0" ] && echo "✅ jp 发布编排全绿" || { echo "✗ jp 发布编排退出码 $RC"; exit "$RC"; }
+  # 七牛上传腿已砍(FID-121,见文件头);handoff 腿 2026-11-15 已砍(jp→GitHub
+  # 工件拉取稳定死亡,发布改本机直传 scripts/local-desktop-publish.mjs)。
+  # 本 pipeline 至此止步于「构建+存工件」;发布动作不再经过本仓库 CI。
 
   finalize:
     name: finalize (status + 播报)
-    needs: [detect, build-mac, build-win, handoff]
+    needs: [detect, build-mac, build-win]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -306,12 +254,12 @@ jobs:
           DETECT: ${{ needs.detect.result }}
           MAC: ${{ needs.build-mac.result }}
           WIN: ${{ needs.build-win.result }}
-          HANDOFF: ${{ needs.handoff.result }}
         run: |
           ok_or_skip() { [[ "$1" == "success" || "$1" == "skipped" ]]; }
-          if [[ "$DETECT" == "failure" || "$HANDOFF" == "failure" ]]; then
+          if [[ "$DETECT" == "failure" ]]; then
             echo "state=failure" >> "$GITHUB_OUTPUT"
-          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" && [[ "$HANDOFF" == "success" ]]; then
+          elif [[ "$DETECT" == "success" ]] && ok_or_skip "$MAC" && ok_or_skip "$WIN" \
+            && { [[ "$MAC" == "success" ]] || [[ "$WIN" == "success" ]]; }; then
             echo "state=success" >> "$GITHUB_OUTPUT"
           else
             echo "state=error" >> "$GITHUB_OUTPUT"
@@ -322,13 +270,13 @@ jobs:
           VERSION: ${{ needs.detect.outputs.version }}
         run: |
           if [ "$STATE" = "success" ]; then
-            echo "::notice title=desktop-build::HunterMate Desktop v${VERSION} 构建+交接完成,发布以 jp 播报为准"
+            echo "::notice title=desktop-build::HunterMate Desktop v${VERSION} 构建完成,工件已存;发布走本机 scripts/local-desktop-publish.mjs --run ${{ github.run_id }}(watcher 常驻则自动)"
           else
             echo "::error title=desktop-build::state=${STATE} version=${VERSION}"
             exit 1
           fi
-      # 失败必响(2026-11-09 定案:发布失败躺一天无人知是事故级缺口):
-      # 构建/交接失败即推企微,带 run 链接。发布本身的成败播报由 jp 编排负责。
+      # 失败必响(2026-11-09 定案:构建失败躺一天无人知是事故级缺口):
+      # 构建失败即推企微,带 run 链接。发布本身的成败由本机 watcher/直传日志负责。
       - name: 企微播报(失败即推)
         if: always() && steps.state.outputs.state != 'success'
         env:
@@ -337,6 +285,6 @@ jobs:
           RUN_URL: https://github.com/hiredchina-com/hc-action-factory/actions/runs/${{ github.run_id }}
           WEBHOOK: ${{ secrets.WECOM_WEBHOOK_URL }}
         run: |
-          MSG="❌ HunterMate Desktop v${VERSION} 构建/交接失败(state=${STATE})\n${RUN_URL}"
+          MSG="❌ HunterMate Desktop v${VERSION} 构建失败(state=${STATE})\n${RUN_URL}"
           curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' "$WEBHOOK" \
             -d "{\"msgtype\":\"markdown\",\"markdown\":{\"content\":\"$MSG\"}}" || true
