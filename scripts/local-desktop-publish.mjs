@@ -73,8 +73,9 @@ function sh(cmd, args, opts = {}) {
   return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 }
 // 二进制输出禁 utf8 解码(编码字符串会毁字节,range 读回校验必须走这个)
+// maxBuffer 必须 > 4MB range 载荷(execFileSync 默认 1MB,2026-11-15 实战 ENOBUFS)
 function shRaw(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return execFileSync(cmd, args, { maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 }
 function ghJson(apiPath) {
   const p = apiPath.startsWith('/') ? apiPath : `/repos/${REPO}/${apiPath}`;
@@ -109,6 +110,70 @@ function resolveSignedUrl(artifactId) {
 function zipIntact(file) {
   try { execFileSync('unzip', ['-tqq', file], { stdio: 'ignore' }); return true; } catch { return false; }
 }
+// 单连接 ~0.1MB/s(2026-11-15 晚高峰实测),整文件并行也只 0.3MB/s 聚合;
+// 必须分段:SEGMENTS 段 ×N 文件并发。每段独立重试,URL 老化(>480s,SAS ~605s
+// 过期见 v0.3.6 定案)或段失败即重解析。段文件攒齐后拼装机。
+const SEGMENTS = 8;
+
+function curlRange(url, start, end, dest) {
+  return new Promise((resolve, reject) => {
+    const p = spawn('curl', ['-fsS', '--max-time', '1800', '-r', `${start}-${end}`, '-o', dest, url],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err.split('\n')[0] || `curl exit ${code}`))));
+  });
+}
+
+async function downloadSegmented(art, signedUrl, destZip, segmentsDir) {
+  const total = art.size_in_bytes;
+  const bounds = [];
+  const step = Math.ceil(total / SEGMENTS);
+  for (let i = 0; i < SEGMENTS; i += 1) {
+    const start = i * step;
+    const end = Math.min(start + step, total) - 1;
+    if (start > end) break;
+    bounds.push([i, start, end]);
+  }
+  let url = signedUrl;
+  let urlAt = Date.now();
+  await Promise.all(bounds.map(async ([i, start, end]) => {
+    const part = path.join(segmentsDir, `seg-${i}`);
+    const want = end - start + 1;
+    for (let attempt = 0; ; attempt += 1) {
+      const have = fs.existsSync(part) ? fs.statSync(part).size : 0;
+      if (have > want) { fs.rmSync(part); continue; }
+      if (have === want) return; // 该段已齐
+      if (Date.now() - urlAt > 480_000 || attempt > 0) {
+        url = resolveSignedUrl(art.id); // SAS 老化/段失败 → 重解析(代际字节确定,可续)
+        urlAt = Date.now();
+      }
+      const s = start + have;
+      try {
+        await curlRange(url, s, end, have ? `${part}.inc` : part);
+        if (have) {
+          fs.appendFileSync(part, fs.readFileSync(`${part}.inc`));
+          fs.rmSync(`${part}.inc`);
+        }
+        if (fs.statSync(part).size === want) return;
+      } catch (e) {
+        if (have && fs.existsSync(`${part}.inc`)) {
+          fs.appendFileSync(part, fs.readFileSync(`${part}.inc`));
+          fs.rmSync(`${part}.inc`);
+        }
+        if (attempt >= 6) throw new Error(`段 ${i} 重试 7 次仍失败:${e.message}`);
+      }
+    }
+  }));
+  // 拼装机
+  const fd = fs.openSync(destZip, 'w');
+  try {
+    for (const [i] of bounds) fs.writeSync(fd, fs.readFileSync(path.join(segmentsDir, `seg-${i}`)));
+  } finally { fs.closeSync(fd); }
+  fs.rmSync(segmentsDir, { recursive: true, force: true });
+  if (fs.statSync(destZip).size !== total) die(`${art.name} 拼装后大小不符:${fs.statSync(destZip).size} ≠ ${total}`);
+}
+
 function downloadArtifact(art, destZip) {
   // 断点续传陷阱:存在≠完整(上次被杀留下半截)。unzip -t 验不过就删了重下。
   if (fs.existsSync(destZip) && fs.statSync(destZip).size > 0 && zipIntact(destZip)) {
@@ -119,20 +184,15 @@ function downloadArtifact(art, destZip) {
     log(`  存在但 zip 不完整(上次中断),删了重下:${path.basename(destZip)}`);
     fs.rmSync(destZip);
   }
-  const url = resolveSignedUrl(art.id);
-  log(`  开始下载 ${art.name} (${(art.size_in_bytes / 1048576).toFixed(0)}MB)→ ${path.basename(destZip)}`);
+  const segmentsDir = `${destZip}.segs`;
+  fs.rmSync(segmentsDir, { recursive: true, force: true });
+  fs.mkdirSync(segmentsDir, { recursive: true });
   const t0 = Date.now();
-  return new Promise((resolve, reject) => {
-    const p = spawn('curl', ['-fsSL', '--retry', '3', '--retry-all-errors', '-o', destZip, url],
-      { stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d; });
-    p.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`下载 ${art.name} 失败:${err.split('\n')[0]}`));
-      const mb = fs.statSync(destZip).size / 1048576;
-      log(`  ✓ ${art.name} ${mb.toFixed(0)}MB in ${((Date.now() - t0) / 1000).toFixed(0)}s (${(mb / ((Date.now() - t0) / 1000)).toFixed(1)}MB/s)`);
-      resolve();
-    });
+  log(`  开始下载 ${art.name} (${(art.size_in_bytes / 1048576).toFixed(0)}MB,${SEGMENTS} 段并行)→ ${path.basename(destZip)}`);
+  const signedUrl = resolveSignedUrl(art.id);
+  return downloadSegmented(art, signedUrl, destZip, segmentsDir).then(() => {
+    const mb = fs.statSync(destZip).size / 1048576;
+    log(`  ✓ ${art.name} ${mb.toFixed(0)}MB in ${((Date.now() - t0) / 1000).toFixed(0)}s (${(mb / ((Date.now() - t0) / 1000)).toFixed(1)}MB/s)`);
   });
 }
 
@@ -286,6 +346,9 @@ async function publishOne(runId, watchNotes, force) {
   // ── 效应端读回(hard-rule 32:断言成功必须读回,不看退出码)─────────────────
   readback(v, files);
   log(`✅ v${v} 发布完成并已读回验证`);
+  // 成功即清工件(每版本 ~3.4GB,/tmp 不养闲人);失败保留现场供排查
+  fs.rmSync(wd, { recursive: true, force: true });
+  log(`  工件已清理:${wd}`);
   return { version: v, workdir: wd, files };
 }
 
