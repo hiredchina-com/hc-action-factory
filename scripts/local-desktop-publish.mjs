@@ -69,13 +69,16 @@ function loadKeys() {
 
 function log(msg) { console.log(`[hmd-local-publish] ${msg}`); }
 function die(msg) { console.error(`✗ [hmd-local-publish] ${msg}`); process.exit(1); }
+// 子进程调用统一超时(2026-11-18 定案:gh api TLS 握手无限挂起拖死 watch 循环 2 小时,
+// execFileSync 默认 timeout=0 永不杀;超时杀子进程抛错,由调用方 catch 进下一轮)
+const CHILD_TIMEOUT_MS = 60 * 1000;
 function sh(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: CHILD_TIMEOUT_MS, ...opts });
 }
 // 二进制输出禁 utf8 解码(编码字符串会毁字节,range 读回校验必须走这个)
 // maxBuffer 必须 > 4MB range 载荷(execFileSync 默认 1MB,2026-11-15 实战 ENOBUFS)
 function shRaw(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return execFileSync(cmd, args, { maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: CHILD_TIMEOUT_MS, ...opts });
 }
 function ghJson(apiPath) {
   const p = apiPath.startsWith('/') ? apiPath : `/repos/${REPO}/${apiPath}`;
@@ -339,7 +342,9 @@ async function publishOne(runId, watchNotes, force) {
     '--base-url', CDN_BASE,
     '--notes', watchNotes || NOTES || `v${v}`,
   ];
-  const up = spawnSync(process.execPath, args, { stdio: 'inherit', env: process.env });
+  // 上传给 30 分钟超时(整包 ~1.6GB,慢速链路实测 ~20min;超时杀子进程,防无限挂起)
+  const up = spawnSync(process.execPath, args, { stdio: 'inherit', env: process.env, timeout: 30 * 60 * 1000 });
+  if (up.error) die(`七牛上传进程异常:${up.error.message}`);
   if (up.status === 1) die('七牛上传硬失败(见上方日志)');
   if (up.status === 2) log('⚠ 上传完成但有降级(IAM 无 list/fusion 权限,旧版清理/CDN 刷新跳过——已知,不阻断)');
 
@@ -395,6 +400,9 @@ function liveVersion() {
 // 故只看构建腿 job 成败 + 工件齐全 + 版本未在线,三重护栏,不依赖 run conclusion。
 function runHasDesktopBuildJobs(runId) {
   const jobs = ghJson(`actions/runs/${runId}/jobs?per_page=50`).jobs;
+  // run 刚创建时 jobs 可能尚未注册(列表为空)——返回 pending,本轮不标任何状态,
+  // 下轮再看;2026-11-18 v0.3.17 被误标 skipped 永久跳过 2.5 小时定案
+  if (jobs.length === 0) return { pending: true };
   // job 名带 "desktop-build / " 前缀(workflow_call 归属),匹配核心名即可
   const legs = jobs.filter((j) => /mac dmg\+zip|win nsis/.test(j.name));
   if (legs.length === 0) return null; // 非 desktop-build 触发的 router run
@@ -402,12 +410,30 @@ function runHasDesktopBuildJobs(runId) {
   return { legs: legs.length, ok };
 }
 
+// ── 扫描阶段看门狗 + 心跳 ─────────────────────────────────────────
+// launchd KeepAlive 只认进程退出、不认挂死(2026-11-18 挂死 2 小时无感知定案),
+// 故扫描阶段单轮超 10 分钟即自毁,KeepAlive 拉起新实例实现自愈。
+// 注意:看门狗只罩扫描阶段,publishOne(下载+上传,实测可达 35min)不在其内——
+// 发布阶段各子调用自有超时,整包上传 spawnSync 另有 30min 超时。
+const SCAN_WATCHDOG_MS = 10 * 60 * 1000;
+const HEARTBEAT_FILE = path.join(os.homedir(), '.config/hc-hw/hmd-local-publish/heartbeat');
+function beat() {
+  fs.mkdirSync(path.dirname(HEARTBEAT_FILE), { recursive: true });
+  fs.writeFileSync(HEARTBEAT_FILE, new Date().toISOString());
+}
+
 async function watch() {
   loadKeys();
   log(`watch 模式启动:每 ${WATCH_INTERVAL_S}s 扫一次 ${REPO} router runs(desktop-build job 识别)`);
   for (;;) {
+    const state = loadState();
+    let todo = null;                        // 扫描阶段只挑一个待发 run,发布放下半段(不看门狗)
+    const wd = setTimeout(() => {
+      console.error('[hmd-local-publish] ✗ 扫描阶段单轮超 10 分钟,看门狗自毁(launchd 将拉起新实例)');
+      process.exit(1);
+    }, SCAN_WATCHDOG_MS);
+    wd.unref();
     try {
-      const state = loadState();
       const due = (r) => {
         const h = state.handled[r.id];
         if (!h) return true;                       // 未处理
@@ -417,26 +443,34 @@ async function watch() {
       const runs = ghJson('actions/runs?per_page=10').workflow_runs.filter((r) => due(r));
       for (const r of runs) {
         const legs = runHasDesktopBuildJobs(r.id);
+        if (legs.pending) continue;                // jobs 未注册,下轮再看(不标 skipped)
         if (!legs) { state.handled[r.id] = { skipped: 'non-desktop' }; saveState(state); continue; }
         if (legs.ok !== legs.legs) continue;         // 构建腿未全绿,等 release-watch 重试救活
-        const live = liveVersion();
-        try {
-          const res = await publishOne(r.id, '', true);
-          if (res.version === live) {
-            log(`run ${r.id} → v${res.version} 已在线,标记处理(幂等)`);
-            state.handled[r.id] = { version: res.version, alreadyLive: true };
-          } else {
-            state.handled[r.id] = { version: res.version, publishedAt: new Date().toISOString() };
-          }
-        } catch (e) {
-          log(`❌ run ${r.id} 自动发布失败:${e.message}(冷却 30min 后重试)`);
-          state.handled[r.id] = { failedAt: new Date().toISOString(), retryAfterMs: 30 * 60 * 1000 };
-        }
-        saveState(state);
+        todo = { run: r, live: liveVersion() };
+        break;                                     // 一次只发一个,发完下轮继续
       }
       if (runs.length === 0) saveState(state);
     } catch (e) {
       log(`⚠ 本轮扫描异常(下轮继续):${e.message}`);
+    } finally {
+      clearTimeout(wd);
+    }
+    beat();                                        // 扫描阶段走完(无论有无异常)= 进程活着,刷新心跳
+    if (todo) {
+      const { run, live } = todo;
+      try {
+        const res = await publishOne(run.id, '', true);
+        if (res.version === live) {
+          log(`run ${run.id} → v${res.version} 已在线,标记处理(幂等)`);
+          state.handled[run.id] = { version: res.version, alreadyLive: true };
+        } else {
+          state.handled[run.id] = { version: res.version, publishedAt: new Date().toISOString() };
+        }
+      } catch (e) {
+        log(`❌ run ${run.id} 自动发布失败:${e.message}(冷却 30min 后重试)`);
+        state.handled[run.id] = { failedAt: new Date().toISOString(), retryAfterMs: 30 * 60 * 1000 };
+      }
+      saveState(state);
     }
     // 清理:只保留最近 20 条 handled 记录,防无限膨胀
     const st = loadState();
